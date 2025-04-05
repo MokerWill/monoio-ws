@@ -1,0 +1,20 @@
+[package]
+name = "monoio-ws"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+base64 = "0.22"
+http = "1"
+monoio = "0.2"
+# Use a custom fork which makes a stream type public.
+monoio-rustls = { git = "https://github.com/discosultan/monoio-tls", branch = "master" }
+rand = "0.9"
+rustls = "0.23"
+sha1 = "0.10"
+thiserror = "2"
+webpki-roots = "0.26"
+
+[dev-dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
