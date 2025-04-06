@@ -18,3 +18,9 @@ webpki-roots = "0.26"
 [dev-dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+divan = "0.1"
+test-case = "3"
+
+[[bench]]
+name = "frame"
+harness = false

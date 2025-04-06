@@ -16,6 +16,7 @@ use monoio::{
     net::TcpStream,
 };
 use monoio_rustls::{Stream, TlsConnector, TlsError};
+use rand::{Rng, SeedableRng, rngs::SmallRng};
 use rustls::{ClientConfig, ClientConnection, pki_types::InvalidDnsNameError};
 
 use self::handshake::handshake;
@@ -71,6 +72,7 @@ pub type Result<T> = (std::result::Result<T, Error>, Vec<u8>);
 
 pub struct Client<S> {
     stream: S,
+    rng: SmallRng,
 }
 
 impl Client<BufReader<Stream<TcpStream, ClientConnection>>> {
@@ -123,7 +125,10 @@ impl Client<BufReader<TcpStream>> {
 
 impl<S> Client<S> {
     pub fn new(stream: S) -> Self {
-        Self { stream }
+        Self {
+            stream,
+            rng: SmallRng::from_os_rng(),
+        }
     }
 }
 
@@ -154,8 +159,10 @@ where
                         fin: true,
                         opcode: Opcode::Pong,
                     };
-                    pong_frame
-                        .encode_control_slice(&mut buf[len..], rand::random::<u32>().to_ne_bytes());
+                    pong_frame.encode_control_slice(
+                        &mut buf[len..],
+                        self.rng.random::<u32>().to_ne_bytes(),
+                    );
                     let (res, buf) = self.write_offset(buf, len).await;
                     match res {
                         Ok(_) => {
@@ -257,8 +264,10 @@ where
                         fin: true,
                         opcode: Opcode::Close,
                     };
-                    close_frame
-                        .encode_control_slice(&mut buf[len..], rand::random::<u32>().to_ne_bytes());
+                    close_frame.encode_control_slice(
+                        &mut buf[len..],
+                        self.rng.random::<u32>().to_ne_bytes(),
+                    );
                     let (res, buf) = self.write_offset(buf, len).await;
                     return match res {
                         Ok(_) => (Err(Error::Closed(close_reason)), buf),
@@ -479,7 +488,7 @@ where
     }
 
     pub async fn write_frame(&mut self, frame: Frame, mut buffer: Vec<u8>) -> Result<()> {
-        frame.encode_vec(&mut buffer, rand::random::<u32>().to_ne_bytes());
+        frame.encode_vec(&mut buffer, self.rng.random::<u32>().to_ne_bytes());
         let (res, buffer) = self.stream.write_all(buffer).await;
         match res {
             Ok(_) => {}
