@@ -135,6 +135,12 @@ impl Frame {
             }
         }
     }
+
+    #[inline]
+    #[must_use]
+    pub fn validate_utf8(data: &[u8]) -> Option<&str> {
+        simdutf8::basic::from_utf8(data).ok()
+    }
 }
 
 unsafe fn mask_data<const HEADER_LEN: usize>(dst: *mut u8, len: usize, mask: [u8; 4]) {
@@ -161,7 +167,7 @@ unsafe fn mask_scalar<const HEADER_LEN: usize>(dst: *mut u8, len: usize, mask: [
         let j = i + HEADER_LEN;
         unsafe {
             dst.add(j)
-                .write(dst.add(i).read() ^ mask.get_unchecked(i & 3))
+                .write(dst.add(i).read() ^ mask.get_unchecked(i & 3));
         }
     }
 }
@@ -180,7 +186,7 @@ unsafe fn mask_simd_x86<const HEADER_LEN: usize>(dst: *mut u8, len: usize, mask:
         for i in (chunks * 16..len).rev() {
             let j = i + HEADER_LEN;
             dst.add(j)
-                .write(dst.add(i).read() ^ mask.get_unchecked(i & 3))
+                .write(dst.add(i).read() ^ mask.get_unchecked(i & 3));
         }
 
         // Then handle full chunks with SIMD.
@@ -191,7 +197,7 @@ unsafe fn mask_simd_x86<const HEADER_LEN: usize>(dst: *mut u8, len: usize, mask:
             let j = i + HEADER_LEN;
             let src = _mm_loadu_si128(dst.add(i) as *const __m128i);
             let masked = _mm_xor_si128(src, mask_x4);
-            _mm_storeu_si128(dst.add(j) as *mut __m128i, masked);
+            _mm_storeu_si128(dst.add(j).cast::<__m128i>(), masked);
         }
     }
 }
@@ -208,7 +214,7 @@ unsafe fn mask_simd_aarch<const HEADER_LEN: usize>(dst: *mut u8, len: usize, mas
         for i in (chunks * 16..len).rev() {
             let j = i + HEADER_LEN;
             dst.add(j)
-                .write(dst.add(i).read() ^ mask.get_unchecked(i & 3))
+                .write(dst.add(i).read() ^ mask.get_unchecked(i & 3));
         }
 
         // Then handle full chunks with SIMD.
@@ -217,7 +223,7 @@ unsafe fn mask_simd_aarch<const HEADER_LEN: usize>(dst: *mut u8, len: usize, mas
         for i in (0..chunks).rev() {
             let i = i * 16;
             let j = i + HEADER_LEN;
-            let src = vld1q_u8(dst.add(i) as *const u8);
+            let src = vld1q_u8(dst.add(i).cast_const());
             let masked = veorq_u8(src, mask_x4);
             vst1q_u8(dst.add(j), masked);
         }
@@ -388,5 +394,31 @@ mod tests {
         frame.encode_vec(&mut input, mask);
 
         input
+    }
+
+    #[test_case(&[], ""; "empty slice")]
+    #[test_case(b"Hello, world!", "Hello, world!"; "ascii")]
+    #[test_case(&[0xC3, 0xA9], "é"; "valid two-byte sequence")]
+    #[test_case(&[0xE2, 0x82, 0xAC], "€"; "valid three-byte sequence")]
+    #[test_case(&[0xF0, 0x9F, 0xA6, 0x80], "🦀"; "valid four-byte sequence")]
+    #[test_case(b"Hello \xC3\xA9\xE2\x82\xAC\xF0\x9F\xA6\x80!", "Hello é€🦀!"; "mixed valid sequences")]
+    #[test_case(&[0xF4, 0x8F, 0xBF, 0xBF], "\u{10FFFF}"; "maximum code point")]
+    #[test_case(&[0xEF, 0xBF, 0xBF], "\u{FFFF}"; "last valid three-byte sequence")]
+    fn test_valid_utf8(input: &[u8], expected: &str) {
+        assert_eq!(Frame::validate_utf8(input), Some(expected));
+    }
+
+    #[test_case(&[0x80]; "continuation byte without start byte")]
+    #[test_case(&[0xFF]; "invalid start byte")]
+    #[test_case(&[0xC3]; "incomplete two-byte sequence")]
+    #[test_case(&[0xE2, 0x82]; "incomplete three-byte sequence")]
+    #[test_case(&[0xF0, 0x9F, 0xA6]; "incomplete four-byte sequence")]
+    #[test_case(&[0xC1, 0x81]; "overlong encoding")]
+    #[test_case(&[0xED, 0xA0, 0x80]; "surrogate code point")]
+    #[test_case(&[0xF5, 0x90, 0x80, 0x80]; "beyond maximum code point")]
+    #[test_case(b"Hello \xC3\xA9\xFF"; "mixed valid invalid")]
+    #[test_case(&[0xF4, 0x90, 0x80, 0x80]; "just beyond maximum code point")]
+    fn test_invalid_utf8(input: &[u8]) {
+        assert_eq!(Frame::validate_utf8(input), None);
     }
 }

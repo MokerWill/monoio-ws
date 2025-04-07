@@ -180,7 +180,7 @@ where
                 Opcode::Continuation => match message {
                     Some(Message::Text) => {
                         if frame.fin {
-                            if str::from_utf8(&buf).is_err() {
+                            if Frame::validate_utf8(&buf).is_none() {
                                 protocol_violation!(
                                     self,
                                     "Received text frame with invalid utf-8."
@@ -213,7 +213,7 @@ where
                                 "Received a continuation frame without continuation opcode."
                             );
                         }
-                        if str::from_utf8(&buf).is_err() {
+                        if Frame::validate_utf8(&buf).is_none() {
                             protocol_violation!(self, "Received text frame with invalid utf-8.");
                         }
                         return (Ok(Message::Text), buf);
@@ -253,7 +253,7 @@ where
                     };
                     // Everything after close code is a utf-8 reason string.
                     let reason = if frame_len > 2 {
-                        let Ok(reason) = str::from_utf8(&buf[len + 2..]) else {
+                        let Some(reason) = Frame::validate_utf8(&buf[len + 2..]) else {
                             protocol_violation!(
                                 self,
                                 "Received close frame with invalid utf-8 reason."
