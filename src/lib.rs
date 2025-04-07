@@ -64,8 +64,11 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("Protocol violation: {0}")]
     ProtocolViolation(&'static str),
-    #[error("The connection has been closed: {0:?}.")]
-    Closed(Option<CloseCode>),
+    #[error("The connection has been closed: {code:?} {reason:?}.")]
+    Closed {
+        code: Option<CloseCode>,
+        reason: Option<String>,
+    },
 }
 
 pub type Result<T> = (std::result::Result<T, Error>, Vec<u8>);
@@ -235,7 +238,7 @@ where
                 }
                 Opcode::Close => {
                     let frame_len = buf.len() - len;
-                    let close_reason = if frame_len >= 2 {
+                    let code = if frame_len >= 2 {
                         let Ok(close_code) =
                             CloseCode::try_from(u16::from_be_bytes([buf[len], buf[len + 1]]))
                         else {
@@ -249,14 +252,17 @@ where
                         None
                     };
                     // Everything after close code is a utf-8 reason string.
-                    if frame_len > 2 {
-                        let Ok(_reason) = str::from_utf8(&buf[len + 2..]) else {
+                    let reason = if frame_len > 2 {
+                        let Ok(reason) = str::from_utf8(&buf[len + 2..]) else {
                             protocol_violation!(
                                 self,
                                 "Received close frame with invalid utf-8 reason."
                             );
                         };
-                    }
+                        Some(reason.to_owned())
+                    } else {
+                        None
+                    };
 
                     // Reply to close with the same code.
                     buf.resize(buf.len() + Frame::CONTROL_HEADER_LEN, 0);
@@ -270,7 +276,7 @@ where
                     );
                     let (res, buf) = self.write_offset(buf, len).await;
                     return match res {
-                        Ok(_) => (Err(Error::Closed(close_reason)), buf),
+                        Ok(_) => (Err(Error::Closed { code, reason }), buf),
                         Err(e) => (Err(e.into()), buf),
                     };
                 }

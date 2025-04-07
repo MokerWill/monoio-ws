@@ -84,7 +84,7 @@ async fn run_test_case(uri: &Uri, case: usize) -> anyhow::Result<()> {
             Ok(()) => {
                 buffer = buf;
             }
-            Err(monoio_ws::Error::ProtocolViolation(_) | monoio_ws::Error::Closed(_)) => {
+            Err(monoio_ws::Error::ProtocolViolation(_) | monoio_ws::Error::Closed { .. }) => {
                 break;
             }
             Err(e) => {
