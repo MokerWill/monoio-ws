@@ -1,13 +1,86 @@
+use std::sync::Arc;
+
 use base64::{Engine, prelude::BASE64_STANDARD};
 use http::Uri;
-use monoio::io::{AsyncBufReadExt, AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt, BufReader};
+use monoio::{
+    io::{AsyncBufReadExt, AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt, BufReader},
+    net::TcpStream,
+};
+use monoio_rustls::{Stream, TlsConnector, TlsError};
 use rand::Rng;
+use rustls::{ClientConfig, ClientConnection, pki_types::InvalidDnsNameError};
 use sha1::{Digest, Sha1};
 
-use crate::{ConnectError, ConnectResult};
+use crate::Client;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ConnectError {
+    #[error("IO: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("TLS: {0}")]
+    Tls(#[from] TlsError),
+    #[error("Invalid handshake response: {0}")]
+    InvalidHandshakeResponse(String),
+    #[error("Invalid Sec-WebSocket-Accept header")]
+    InvalidWebSocketAcceptHeader,
+    #[error("DNS: {0}")]
+    InvalidDnsName(#[from] InvalidDnsNameError),
+    #[error("Attempted to connect with invalid URI scheme")]
+    InvalidUriScheme,
+}
+
+pub type ConnectResult<T> = std::result::Result<T, ConnectError>;
+
+impl Client<BufReader<Stream<TcpStream, ClientConnection>>> {
+    pub async fn connect_tls(uri: &Uri) -> ConnectResult<Self> {
+        if uri.scheme_str() != Some("wss") {
+            return Err(ConnectError::InvalidUriScheme);
+        }
+
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+        let config = ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+
+        let connector = TlsConnector::from(Arc::new(config));
+        let server_name =
+            rustls::pki_types::ServerName::try_from(uri.host().unwrap_or_default().to_string())?;
+
+        // Connect, upgrade to TLS and perform WebSocket handshake.
+        let stream = TcpStream::connect(format!(
+            "{}:{}",
+            uri.host().unwrap_or_default(),
+            uri.port_u16().unwrap_or(443)
+        ))
+        .await?;
+
+        let stream = connector.connect(server_name, stream).await?;
+        Ok(Self::new(handshake(stream, uri).await?))
+    }
+}
+
+impl Client<BufReader<TcpStream>> {
+    pub async fn connect_plain(uri: &Uri) -> ConnectResult<Self> {
+        if uri.scheme_str() != Some("ws") {
+            return Err(ConnectError::InvalidUriScheme);
+        }
+
+        // Connect and perform WebSocket handshake.
+        let stream = TcpStream::connect(format!(
+            "{}:{}",
+            uri.host().unwrap_or_default(),
+            uri.port_u16().unwrap_or(80)
+        ))
+        .await?;
+
+        Ok(Self::new(handshake(stream, uri).await?))
+    }
+}
 
 /// Performs a WebSocket handshake on an existing TCP connection via HTTP 1.
-pub async fn handshake<T>(stream: T, uri: &Uri) -> ConnectResult<BufReader<T>>
+async fn handshake<T>(stream: T, uri: &Uri) -> ConnectResult<BufReader<T>>
 where
     T: AsyncReadRent + AsyncWriteRent,
 {
