@@ -1,9 +1,9 @@
-use std::sync::Arc;
+use std::{io, sync::Arc};
 
 use base64::{Engine, prelude::BASE64_STANDARD};
 use http::Uri;
 use monoio::{
-    io::{AsyncBufReadExt, AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt, BufReader},
+    io::{AsyncReadRent, AsyncReadRentExt, AsyncWriteRent, AsyncWriteRentExt},
     net::TcpStream,
 };
 use monoio_rustls::{Stream, TlsConnector, TlsError};
@@ -31,7 +31,7 @@ pub enum ConnectError {
 
 pub type ConnectResult<T> = std::result::Result<T, ConnectError>;
 
-impl Client<BufReader<Stream<TcpStream, ClientConnection>>> {
+impl Client<Stream<TcpStream, ClientConnection>> {
     pub async fn connect_tls(uri: &Uri) -> ConnectResult<Self> {
         if uri.scheme_str() != Some("wss") {
             return Err(ConnectError::InvalidUriScheme);
@@ -61,7 +61,7 @@ impl Client<BufReader<Stream<TcpStream, ClientConnection>>> {
     }
 }
 
-impl Client<BufReader<TcpStream>> {
+impl Client<TcpStream> {
     pub async fn connect_plain(uri: &Uri) -> ConnectResult<Self> {
         if uri.scheme_str() != Some("ws") {
             return Err(ConnectError::InvalidUriScheme);
@@ -80,12 +80,10 @@ impl Client<BufReader<TcpStream>> {
 }
 
 /// Performs a WebSocket handshake on an existing TCP connection via HTTP 1.
-async fn handshake<T>(stream: T, uri: &Uri) -> ConnectResult<BufReader<T>>
+async fn handshake<T>(mut stream: T, uri: &Uri) -> ConnectResult<T>
 where
     T: AsyncReadRent + AsyncWriteRent,
 {
-    let mut stream = BufReader::new(stream);
-
     // Generate a random key for the handshake.
     let mut rng = rand::rng();
     let mut key_bytes = [0u8; 16];
@@ -100,16 +98,12 @@ where
     result?;
 
     // Read the response.
-    // let buffer = vec![0u8; 2048];
-    // let (result, buffer) = stream.read(buffer).await;
-    // let bytes_read = result.map_err(Error::Connect)?;
-    // let response = String::from_utf8_lossy(&buffer[..bytes_read]);
-
     let mut response = String::with_capacity(2048);
     loop {
-        let bytes_read = stream.read_line(&mut response).await?;
-        // Ending is denoted with CRLF (2 bytes).
-        if bytes_read <= 2 {
+        let line = read_line(&mut stream).await?;
+        response.push_str(&line);
+        // Empty line signals end of headers.
+        if line == "\r\n" {
             break;
         }
     }
@@ -154,6 +148,28 @@ fn http_request(uri: &Uri, key: &str) -> String {
             .map(ToString::to_string)
             .unwrap_or_default(),
     )
+}
+
+async fn read_line<T>(stream: &mut T) -> io::Result<String>
+where
+    T: AsyncReadRent,
+{
+    let mut line = Vec::new();
+    let mut buf = Box::new([0u8; 1]);
+
+    loop {
+        // Read byte-by-byte.
+        let (result, read_buf) = stream.read_exact(buf).await;
+        let _ = result?;
+        buf = read_buf;
+
+        line.push(buf[0]);
+        if line.ends_with(b"\r\n") {
+            break;
+        }
+    }
+
+    String::from_utf8(line).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid UTF-8"))
 }
 
 #[cfg(test)]

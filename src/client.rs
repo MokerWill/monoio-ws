@@ -3,7 +3,9 @@ use std::{str, sync::LazyLock};
 use monoio::{
     BufResult,
     buf::{IoBufMut, Slice, SliceMut},
-    io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt},
+    io::{
+        AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt, OwnedReadHalf, OwnedWriteHalf, Splitable,
+    },
 };
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
@@ -42,15 +44,24 @@ pub enum Error {
 
 pub type Result<T> = (std::result::Result<T, Error>, Vec<u8>);
 
-pub struct Client<S> {
-    stream: S,
+pub struct Client<S>
+where
+    S: AsyncWriteRent,
+{
+    read_half: OwnedReadHalf<S>,
+    write_half: OwnedWriteHalf<S>,
     rng: SmallRng,
 }
 
-impl<S> Client<S> {
+impl<S> Client<S>
+where
+    S: AsyncWriteRent + Splitable<OwnedRead = OwnedReadHalf<S>, OwnedWrite = OwnedWriteHalf<S>>,
+{
     pub fn new(stream: S) -> Self {
+        let (read_half, write_half) = stream.into_split();
         Self {
-            stream,
+            read_half,
+            write_half,
             rng: SmallRng::from_os_rng(),
         }
     }
@@ -329,7 +340,7 @@ where
         let mut read = 0;
         while read < len {
             let buf_slice = unsafe { SliceMut::new_unchecked(buf, offset + read, end) };
-            let (result, buf_slice) = self.stream.read(buf_slice).await;
+            let (result, buf_slice) = self.read_half.read(buf_slice).await;
             buf = buf_slice.into_inner();
             match result {
                 Ok(0) => {
@@ -416,7 +427,7 @@ where
 
     pub async fn write_frame(&mut self, frame: Frame, mut buffer: Vec<u8>) -> Result<()> {
         frame.encode_vec(&mut buffer, self.rng.random::<u32>().to_ne_bytes());
-        let (res, buffer) = self.stream.write_all(buffer).await;
+        let (res, buffer) = self.write_half.write_all(buffer).await;
         match res {
             Ok(_) => {}
             Err(e) => return (Err(e.into()), buffer),
@@ -429,7 +440,7 @@ where
         let mut written = 0;
         while written < len {
             let buf_slice = unsafe { Slice::new_unchecked(buf, offset + written, offset + len) };
-            let (result, buf_slice) = self.stream.write(buf_slice).await;
+            let (result, buf_slice) = self.write_half.write(buf_slice).await;
             buf = buf_slice.into_inner();
             match result {
                 Ok(0) => {

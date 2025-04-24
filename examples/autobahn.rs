@@ -2,7 +2,7 @@ use std::str::{self, FromStr};
 
 use clap::Parser;
 use http::uri::Uri;
-use monoio::io::{AsyncReadRent, AsyncWriteRent};
+use monoio::io::{AsyncReadRent, AsyncWriteRent, Split};
 use monoio_ws::{Client, CloseCode, Opcode};
 
 // Agent name reported to the test server.
@@ -98,7 +98,7 @@ async fn run_test_case(uri: &Uri, case: usize) -> anyhow::Result<()> {
 }
 
 async fn process_message(
-    client: &mut Client<impl AsyncReadRent + AsyncWriteRent>,
+    client: &mut Client<impl AsyncReadRent + AsyncWriteRent + Split>,
     buffer: Vec<u8>,
 ) -> monoio_ws::Result<()> {
     let (res, buffer) = client.next_msg(buffer).await;
