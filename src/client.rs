@@ -1,15 +1,14 @@
-use std::{str, sync::LazyLock};
+use std::{io, str, sync::LazyLock};
 
-use monoio::{
-    BufResult,
-    buf::{IoBufMut, Slice, SliceMut},
-    io::{
-        AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt, OwnedReadHalf, OwnedWriteHalf, Splitable,
-    },
+use monoio::io::{
+    AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt, OwnedReadHalf, OwnedWriteHalf, Splitable,
 };
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
-use crate::{CloseCode, Frame, Message, Opcode};
+use crate::{
+    CloseCode, Frame, Message, Opcode,
+    io::{AsyncReadRentExt as _, AsyncWriteRentExt as _},
+};
 
 macro_rules! protocol_violation {
     ($self:expr, $reason:expr) => {
@@ -32,7 +31,7 @@ pub static PROTOCOL_ERROR: LazyLock<Vec<u8>> = LazyLock::new(|| {
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("IO: {0}")]
-    Io(#[from] std::io::Error),
+    Io(#[from] io::Error),
     #[error("Protocol violation: {0}")]
     ProtocolViolation(&'static str),
     #[error("The connection has been closed: {code:?} {reason:?}.")]
@@ -98,7 +97,7 @@ where
                         &mut buf[len..],
                         self.rng.random::<u32>().to_ne_bytes(),
                     );
-                    let (res, buf) = self.write_offset(buf, len).await;
+                    let (res, buf) = self.write_half.write_offset(buf, len).await;
                     match res {
                         Ok(_) => {
                             buffer = buf;
@@ -206,7 +205,7 @@ where
                         &mut buf[len..],
                         self.rng.random::<u32>().to_ne_bytes(),
                     );
-                    let (res, buf) = self.write_offset(buf, len).await;
+                    let (res, buf) = self.write_half.write_offset(buf, len).await;
                     return match res {
                         Ok(_) => (Err(Error::Closed { code, reason }), buf),
                         Err(e) => (Err(e.into()), buf),
@@ -226,7 +225,7 @@ where
         let data_len = buffer.len();
 
         buffer.resize(data_len + HEADER_LEN, 0);
-        let (res, mut buffer) = self.read_extend(buffer, HEADER_LEN).await;
+        let (res, mut buffer) = self.read_half.read_extend(buffer, HEADER_LEN).await;
         match res {
             Ok(_) => {}
             Err(e) => {
@@ -287,7 +286,8 @@ where
                     126 => {
                         const LENGTH_LEN: usize = 2;
                         buffer.resize(data_len + LENGTH_LEN, 0);
-                        let (res, mut buffer) = self.read_extend(buffer, LENGTH_LEN).await;
+                        let (res, mut buffer) =
+                            self.read_half.read_extend(buffer, LENGTH_LEN).await;
                         match res {
                             Ok(_) => {}
                             Err(e) => {
@@ -302,7 +302,8 @@ where
                     127 => {
                         const LENGTH_LEN: usize = 8;
                         buffer.resize(data_len + LENGTH_LEN, 0);
-                        let (res, mut buffer) = self.read_extend(buffer, LENGTH_LEN).await;
+                        let (res, mut buffer) =
+                            self.read_half.read_extend(buffer, LENGTH_LEN).await;
                         match res {
                             Ok(_) => {}
                             Err(e) => {
@@ -319,7 +320,7 @@ where
             }
         }
 
-        let (res, buffer) = self.read_extend(buffer, length).await;
+        let (res, buffer) = self.read_half.read_extend(buffer, length).await;
         match res {
             Ok(_) => {}
             Err(e) => {
@@ -329,38 +330,6 @@ where
 
         let frame = Frame { fin, opcode };
         (Ok(frame), buffer)
-    }
-
-    async fn read_extend(&mut self, mut buf: Vec<u8>, len: usize) -> BufResult<usize, Vec<u8>> {
-        let offset = buf.len();
-        let end = offset + len;
-
-        buf.reserve(len);
-
-        let mut read = 0;
-        while read < len {
-            let buf_slice = unsafe { SliceMut::new_unchecked(buf, offset + read, end) };
-            let (result, buf_slice) = self.read_half.read(buf_slice).await;
-            buf = buf_slice.into_inner();
-            match result {
-                Ok(0) => {
-                    return (
-                        Err(std::io::Error::new(
-                            std::io::ErrorKind::UnexpectedEof,
-                            "failed to fill whole buffer",
-                        )),
-                        buf,
-                    );
-                }
-                Ok(n) => {
-                    read += n;
-                    unsafe { buf.set_init(offset + read) };
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => return (Err(e), buf),
-            }
-        }
-        (Ok(read), buf)
     }
 
     pub async fn send_ping(&mut self, buf: Vec<u8>) -> Result<()> {
@@ -433,30 +402,5 @@ where
             Err(e) => return (Err(e.into()), buffer),
         }
         (Ok(()), buffer)
-    }
-
-    async fn write_offset(&mut self, mut buf: Vec<u8>, offset: usize) -> BufResult<usize, Vec<u8>> {
-        let len = buf.len() - offset;
-        let mut written = 0;
-        while written < len {
-            let buf_slice = unsafe { Slice::new_unchecked(buf, offset + written, offset + len) };
-            let (result, buf_slice) = self.write_half.write(buf_slice).await;
-            buf = buf_slice.into_inner();
-            match result {
-                Ok(0) => {
-                    return (
-                        Err(std::io::Error::new(
-                            std::io::ErrorKind::WriteZero,
-                            "failed to write whole buffer",
-                        )),
-                        buf,
-                    );
-                }
-                Ok(n) => written += n,
-                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => return (Err(e), buf),
-            }
-        }
-        (Ok(written), buf)
     }
 }

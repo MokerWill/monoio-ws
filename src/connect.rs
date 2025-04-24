@@ -16,7 +16,7 @@ use crate::Client;
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectError {
     #[error("IO: {0}")]
-    Io(#[from] std::io::Error),
+    Io(#[from] io::Error),
     #[error("TLS: {0}")]
     Tls(#[from] TlsError),
     #[error("Invalid handshake response: {0}")]
