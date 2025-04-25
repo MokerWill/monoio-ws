@@ -1,4 +1,4 @@
-use std::{io, str, sync::LazyLock};
+use std::{io, mem, str, sync::LazyLock};
 
 use monoio::io::{
     AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt, OwnedReadHalf, OwnedWriteHalf, Splitable,
@@ -47,9 +47,8 @@ pub struct Client<S>
 where
     S: AsyncWriteRent,
 {
-    read_half: OwnedReadHalf<S>,
-    write_half: OwnedWriteHalf<S>,
-    rng: SmallRng,
+    read_half: ReadHalf<S>,
+    write_half: WriteHalf<S>,
 }
 
 impl<S> Client<S>
@@ -59,9 +58,11 @@ where
     pub fn new(stream: S) -> Self {
         let (read_half, write_half) = stream.into_split();
         Self {
-            read_half,
-            write_half,
-            rng: SmallRng::from_os_rng(),
+            read_half: ReadHalf { inner: read_half },
+            write_half: WriteHalf {
+                inner: write_half,
+                rng: SmallRng::from_os_rng(),
+            },
         }
     }
 }
@@ -93,18 +94,17 @@ where
                         fin: true,
                         opcode: Opcode::Pong,
                     };
-                    pong_frame.encode_control_slice(
-                        &mut buf[len..],
-                        self.rng.random::<u32>().to_ne_bytes(),
-                    );
-                    let (res, buf) = self.write_half.write_offset(buf, len).await;
+                    let (res, buf) = self
+                        .write_half
+                        .write_control_frame_offset(pong_frame, buf, len)
+                        .await;
                     match res {
                         Ok(_) => {
                             buffer = buf;
                             buffer.truncate(len);
                         }
                         Err(e) => {
-                            return (Err(e.into()), buf);
+                            return (Err(e), buf);
                         }
                     }
                 }
@@ -201,14 +201,13 @@ where
                         fin: true,
                         opcode: Opcode::Close,
                     };
-                    close_frame.encode_control_slice(
-                        &mut buf[len..],
-                        self.rng.random::<u32>().to_ne_bytes(),
-                    );
-                    let (res, buf) = self.write_half.write_offset(buf, len).await;
+                    let (res, buf) = self
+                        .write_half
+                        .write_control_frame_offset(close_frame, buf, len)
+                        .await;
                     return match res {
                         Ok(_) => (Err(Error::Closed { code, reason }), buf),
-                        Err(e) => (Err(e.into()), buf),
+                        Err(e) => (Err(e), buf),
                     };
                 }
                 Opcode::Pong => {
@@ -220,116 +219,17 @@ where
         }
     }
 
-    pub async fn read_frame(&mut self, mut buffer: Vec<u8>) -> Result<Frame> {
-        const HEADER_LEN: usize = 2;
-        let data_len = buffer.len();
-
-        buffer.resize(data_len + HEADER_LEN, 0);
-        let (res, mut buffer) = self.read_half.read_extend(buffer, HEADER_LEN).await;
-        match res {
-            Ok(_) => {}
-            Err(e) => {
-                return (Err(e.into()), buffer);
-            }
-        }
-        let b1 = buffer[buffer.len() - 2];
-        let b2 = buffer[buffer.len() - 1];
-        buffer.truncate(data_len);
-
-        let fin = b1 & 0x80 != 0;
-        let rsv = b1 & 0x70;
-        let opcode = unsafe { std::mem::transmute::<u8, Opcode>(b1 & 0x0F) };
-        let masked = b2 & 0x80 != 0;
-        let mut length = (b2 & 0x7F) as usize;
-
-        if rsv != 0 {
-            protocol_violation!(self, "Reserve bit must be 0.");
-        }
-        if masked {
-            protocol_violation!(self, "Server to client communication should be unmasked.");
-        }
-
-        match opcode {
-            Opcode::Reserved3
-            | Opcode::Reserved4
-            | Opcode::Reserved5
-            | Opcode::Reserved6
-            | Opcode::Reserved7
-            | Opcode::ReservedB
-            | Opcode::ReservedC
-            | Opcode::ReservedD
-            | Opcode::ReservedE
-            | Opcode::ReservedF => {
-                protocol_violation!(self, "Use of reserved opcode.");
-            }
-            Opcode::Close => {
-                if length == 1 {
-                    protocol_violation!(self, "Close frame with a missing close reason byte.");
-                }
-                if length > 125 {
-                    protocol_violation!(self, "Control frame larger than 125 bytes.");
-                }
-                if !fin {
-                    protocol_violation!(self, "Control frame cannot be fragmented.");
+    pub async fn read_frame(&mut self, buffer: Vec<u8>) -> Result<Frame> {
+        match self.read_half.read_frame(buffer).await {
+            (Ok(res), buffer) => (Ok(res), buffer),
+            (Err(Error::ProtocolViolation(reason)), buffer) => {
+                match self.send_close(PROTOCOL_ERROR.clone()).await {
+                    (Ok(()), _) => (Err(Error::ProtocolViolation(reason)), buffer),
+                    (Err(err), _) => (Err(err), buffer),
                 }
             }
-            Opcode::Ping | Opcode::Pong => {
-                if length > 125 {
-                    protocol_violation!(self, "Control frame larger than 125 bytes.");
-                }
-                if !fin {
-                    protocol_violation!(self, "Control frame cannot be fragmented.");
-                }
-            }
-            Opcode::Text | Opcode::Binary | Opcode::Continuation => {
-                (length, buffer) = match length {
-                    126 => {
-                        const LENGTH_LEN: usize = 2;
-                        buffer.resize(data_len + LENGTH_LEN, 0);
-                        let (res, mut buffer) =
-                            self.read_half.read_extend(buffer, LENGTH_LEN).await;
-                        match res {
-                            Ok(_) => {}
-                            Err(e) => {
-                                return (Err(e.into()), buffer);
-                            }
-                        }
-                        let mut bytes = [0u8; LENGTH_LEN];
-                        bytes.copy_from_slice(&buffer[buffer.len() - LENGTH_LEN..]);
-                        buffer.truncate(data_len);
-                        (u16::from_be_bytes(bytes) as usize, buffer)
-                    }
-                    127 => {
-                        const LENGTH_LEN: usize = 8;
-                        buffer.resize(data_len + LENGTH_LEN, 0);
-                        let (res, mut buffer) =
-                            self.read_half.read_extend(buffer, LENGTH_LEN).await;
-                        match res {
-                            Ok(_) => {}
-                            Err(e) => {
-                                return (Err(e.into()), buffer);
-                            }
-                        }
-                        let mut bytes = [0u8; LENGTH_LEN];
-                        bytes.copy_from_slice(&buffer[buffer.len() - LENGTH_LEN..]);
-                        buffer.truncate(data_len);
-                        (u64::from_be_bytes(bytes) as usize, buffer)
-                    }
-                    length => (length, buffer),
-                };
-            }
+            (Err(err), buffer) => (Err(err), buffer),
         }
-
-        let (res, buffer) = self.read_half.read_extend(buffer, length).await;
-        match res {
-            Ok(_) => {}
-            Err(e) => {
-                return (Err(e.into()), buffer);
-            }
-        }
-
-        let frame = Frame { fin, opcode };
-        (Ok(frame), buffer)
     }
 
     pub async fn send_ping(&mut self, buf: Vec<u8>) -> Result<()> {
@@ -394,9 +294,199 @@ where
         (res, buf)
     }
 
+    pub async fn write_frame(&mut self, frame: Frame, buffer: Vec<u8>) -> Result<()> {
+        self.write_half.write_frame(frame, buffer).await
+    }
+}
+
+struct ReadHalf<S> {
+    inner: OwnedReadHalf<S>,
+}
+
+impl<S> ReadHalf<S>
+where
+    S: AsyncReadRent,
+{
+    pub async fn read_frame(&mut self, mut buffer: Vec<u8>) -> Result<Frame> {
+        const HEADER_LEN: usize = 2;
+        let data_len = buffer.len();
+
+        buffer.resize(data_len + HEADER_LEN, 0);
+        let (res, mut buffer) = self.inner.read_extend(buffer, HEADER_LEN).await;
+        match res {
+            Ok(_) => {}
+            Err(e) => {
+                return (Err(e.into()), buffer);
+            }
+        }
+        let b1 = buffer[buffer.len() - 2];
+        let b2 = buffer[buffer.len() - 1];
+        buffer.truncate(data_len);
+
+        let fin = b1 & 0x80 != 0;
+        let rsv = b1 & 0x70;
+        let opcode = unsafe { mem::transmute::<u8, Opcode>(b1 & 0x0F) };
+        let masked = b2 & 0x80 != 0;
+        let mut length = (b2 & 0x7F) as usize;
+
+        if rsv != 0 {
+            return (
+                Err(Error::ProtocolViolation("Reserve bit must be 0.")),
+                buffer,
+            );
+        }
+        if masked {
+            return (
+                Err(Error::ProtocolViolation(
+                    "Server to client communication should be unmasked.",
+                )),
+                buffer,
+            );
+        }
+
+        match opcode {
+            Opcode::Reserved3
+            | Opcode::Reserved4
+            | Opcode::Reserved5
+            | Opcode::Reserved6
+            | Opcode::Reserved7
+            | Opcode::ReservedB
+            | Opcode::ReservedC
+            | Opcode::ReservedD
+            | Opcode::ReservedE
+            | Opcode::ReservedF => {
+                return (
+                    Err(Error::ProtocolViolation("Use of reserved opcode.")),
+                    buffer,
+                );
+            }
+            Opcode::Close => {
+                if length == 1 {
+                    return (
+                        Err(Error::ProtocolViolation(
+                            "Close frame with a missing close reason byte.",
+                        )),
+                        buffer,
+                    );
+                }
+                if length > 125 {
+                    return (
+                        Err(Error::ProtocolViolation(
+                            "Control frame larger than 125 bytes.",
+                        )),
+                        buffer,
+                    );
+                }
+                if !fin {
+                    return (
+                        Err(Error::ProtocolViolation(
+                            "Control frame cannot be fragmented.",
+                        )),
+                        buffer,
+                    );
+                }
+            }
+            Opcode::Ping | Opcode::Pong => {
+                if length > 125 {
+                    return (
+                        Err(Error::ProtocolViolation(
+                            "Control frame larger than 125 bytes.",
+                        )),
+                        buffer,
+                    );
+                }
+                if !fin {
+                    return (
+                        Err(Error::ProtocolViolation(
+                            "Control frame cannot be fragmented.",
+                        )),
+                        buffer,
+                    );
+                }
+            }
+            Opcode::Text | Opcode::Binary | Opcode::Continuation => {
+                (length, buffer) = match length {
+                    126 => {
+                        const LENGTH_LEN: usize = 2;
+                        buffer.resize(data_len + LENGTH_LEN, 0);
+                        let (res, mut buffer) = self.inner.read_extend(buffer, LENGTH_LEN).await;
+                        match res {
+                            Ok(_) => {}
+                            Err(e) => {
+                                return (Err(e.into()), buffer);
+                            }
+                        }
+                        let mut bytes = [0u8; LENGTH_LEN];
+                        bytes.copy_from_slice(&buffer[buffer.len() - LENGTH_LEN..]);
+                        buffer.truncate(data_len);
+                        (u16::from_be_bytes(bytes) as usize, buffer)
+                    }
+                    127 => {
+                        const LENGTH_LEN: usize = 8;
+                        buffer.resize(data_len + LENGTH_LEN, 0);
+                        let (res, mut buffer) = self.inner.read_extend(buffer, LENGTH_LEN).await;
+                        match res {
+                            Ok(_) => {}
+                            Err(e) => {
+                                return (Err(e.into()), buffer);
+                            }
+                        }
+                        let mut bytes = [0u8; LENGTH_LEN];
+                        bytes.copy_from_slice(&buffer[buffer.len() - LENGTH_LEN..]);
+                        buffer.truncate(data_len);
+                        (u64::from_be_bytes(bytes) as usize, buffer)
+                    }
+                    length => (length, buffer),
+                };
+            }
+        }
+
+        let (res, buffer) = self.inner.read_extend(buffer, length).await;
+        match res {
+            Ok(_) => {}
+            Err(e) => {
+                return (Err(e.into()), buffer);
+            }
+        }
+
+        let frame = Frame { fin, opcode };
+        (Ok(frame), buffer)
+    }
+}
+
+struct WriteHalf<S>
+where
+    S: AsyncWriteRent,
+{
+    inner: OwnedWriteHalf<S>,
+    rng: SmallRng,
+}
+
+impl<S> WriteHalf<S>
+where
+    S: AsyncWriteRent,
+{
     pub async fn write_frame(&mut self, frame: Frame, mut buffer: Vec<u8>) -> Result<()> {
         frame.encode_vec(&mut buffer, self.rng.random::<u32>().to_ne_bytes());
-        let (res, buffer) = self.write_half.write_all(buffer).await;
+        let (res, buffer) = self.inner.write_all(buffer).await;
+        match res {
+            Ok(_) => {}
+            Err(e) => return (Err(e.into()), buffer),
+        }
+        (Ok(()), buffer)
+    }
+
+    pub async fn write_control_frame_offset(
+        &mut self,
+        frame: Frame,
+        mut buffer: Vec<u8>,
+        offset: usize,
+    ) -> Result<()> {
+        frame.encode_control_slice(
+            &mut buffer[offset..],
+            self.rng.random::<u32>().to_ne_bytes(),
+        );
+        let (res, buffer) = self.inner.write_offset(buffer, offset).await;
         match res {
             Ok(_) => {}
             Err(e) => return (Err(e.into()), buffer),

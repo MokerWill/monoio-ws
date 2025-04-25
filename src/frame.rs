@@ -176,8 +176,9 @@ unsafe fn mask_scalar<const HEADER_LEN: usize>(dst: *mut u8, len: usize, mask: [
 #[target_feature(enable = "ssse3")]
 #[inline]
 unsafe fn mask_simd_x86<const HEADER_LEN: usize>(dst: *mut u8, len: usize, mask: [u8; 4]) {
-    use std::arch::x86_64::{
-        __m128i, _mm_loadu_si128, _mm_set1_epi32, _mm_storeu_si128, _mm_xor_si128,
+    use std::{
+        arch::x86_64::{__m128i, _mm_loadu_si128, _mm_set1_epi32, _mm_storeu_si128, _mm_xor_si128},
+        mem,
     };
 
     let chunks = len / 16;
@@ -190,7 +191,7 @@ unsafe fn mask_simd_x86<const HEADER_LEN: usize>(dst: *mut u8, len: usize, mask:
         }
 
         // Then handle full chunks with SIMD.
-        let mask_value = std::mem::transmute::<[u8; 4], i32>(mask);
+        let mask_value = mem::transmute::<[u8; 4], i32>(mask);
         let mask_x4 = _mm_set1_epi32(mask_value);
         for i in (0..chunks).rev() {
             let i = i * 16;
@@ -206,7 +207,10 @@ unsafe fn mask_simd_x86<const HEADER_LEN: usize>(dst: *mut u8, len: usize, mask:
 #[target_feature(enable = "neon")]
 #[inline]
 unsafe fn mask_simd_aarch<const HEADER_LEN: usize>(dst: *mut u8, len: usize, mask: [u8; 4]) {
-    use std::arch::aarch64::{uint8x16_t, uint32x4_t, vdupq_n_u32, veorq_u8, vld1q_u8, vst1q_u8};
+    use std::{
+        arch::aarch64::{uint8x16_t, uint32x4_t, vdupq_n_u32, veorq_u8, vld1q_u8, vst1q_u8},
+        mem,
+    };
 
     let chunks = len / 16;
     unsafe {
@@ -218,8 +222,8 @@ unsafe fn mask_simd_aarch<const HEADER_LEN: usize>(dst: *mut u8, len: usize, mas
         }
 
         // Then handle full chunks with SIMD.
-        let mask_value = std::mem::transmute::<[u8; 4], u32>(mask);
-        let mask_x4 = std::mem::transmute::<uint32x4_t, uint8x16_t>(vdupq_n_u32(mask_value));
+        let mask_value = mem::transmute::<[u8; 4], u32>(mask);
+        let mask_x4 = mem::transmute::<uint32x4_t, uint8x16_t>(vdupq_n_u32(mask_value));
         for i in (0..chunks).rev() {
             let i = i * 16;
             let j = i + HEADER_LEN;
