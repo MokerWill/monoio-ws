@@ -1,7 +1,10 @@
+use std::ptr;
+
 use crate::Opcode;
 
 // 2 byte header + 4 byte masking key.
 const CONTROL_HEADER_LEN: usize = 6;
+const MAX_HEADER_LEN: usize = 14;
 const MASK_BIT: u8 = 0x80;
 
 #[derive(Clone, Copy, Debug)]
@@ -30,109 +33,118 @@ pub struct Frame {
 
 impl Frame {
     pub const CONTROL_HEADER_LEN: usize = CONTROL_HEADER_LEN;
+    pub const MAX_HEADER_LEN: usize = MAX_HEADER_LEN;
 
-    /// Header space needs to be pre-allocated for the slice!
     #[inline]
-    pub fn encode_control_slice(self, data: &mut [u8], mask: [u8; 4]) {
-        let data_len = data.len() - CONTROL_HEADER_LEN;
+    #[expect(clippy::uninit_vec)]
+    pub fn encode_control(self, src: &[u8], dst: &mut Vec<u8>, mask: [u8; 4]) {
+        let data_len = src.len();
+        let len = CONTROL_HEADER_LEN + data_len;
 
         // SAFE IMPL
-        // // Assumes data is contained in the 0..data.len() - 6 part.
-        // for i in (Self::CONTROL_HEADER_LEN..data.len()).rev() {
-        //     let j = i - Self::CONTROL_HEADER_LEN;
-        //     data[i] = data[j] ^ mask[j & 3];
+        // dst.resize(len, 0);
+
+        // dst[0] = ((self.fin as u8) << 7) | self.opcode as u8;
+        // dst[1] = MASK_BIT | data_len as u8;
+
+        // dst[2..6].copy_from_slice(&mask);
+
+        // for i in 0..src.len() {
+        //     dst[i + CONTROL_HEADER_LEN] = src[i] ^ mask[i & 3];
         // }
 
-        // data[0] = ((self.fin as u8) << 7) | self.opcode as u8;
-        // data[1] = Self::MASK_BIT | data_len as u8;
-
-        // data[2..6].copy_from_slice(&mask);
-
         // UNSAFE IMPL
+        dst.reserve(len);
         unsafe {
-            let dst = data.as_mut_ptr();
-            mask_data::<CONTROL_HEADER_LEN>(dst, data_len, mask);
+            dst.set_len(len);
+
+            let src = src.as_ptr();
+            let dst = dst.as_mut_ptr();
+
             dst.write(((self.fin as u8) << 7) | self.opcode as u8);
             dst.add(1).write(MASK_BIT | data_len as u8);
-            std::ptr::copy_nonoverlapping(mask.as_ptr(), data.as_mut_ptr().add(2), mask.len());
+            ptr::copy_nonoverlapping(mask.as_ptr(), dst.add(2), mask.len());
+            mask_data(src, dst.add(6), data_len, mask);
         }
     }
 
     #[inline]
-    pub fn encode_vec(self, data: &mut Vec<u8>, mask: [u8; 4]) {
-        let data_len = data.len();
+    #[expect(clippy::uninit_vec)]
+    pub fn encode(self, src: &[u8], dst: &mut Vec<u8>, mask: [u8; 4]) {
+        let data_len = src.len();
         let header_len = match data_len {
             ..126 => 6,
             126..65536 => 8,
             _ => 14,
         };
-
-        data.resize(data_len + header_len, 0);
+        let len = header_len + data_len;
 
         // SAFE IMPL
-        // for i in (header_len..data.len()).rev() {
-        //     let j = i - header_len;
-        //     data[i] = data[j] ^ mask[j & 3];
-        // }
+        // dst.resize(len, 0);
 
-        // data[0] = ((self.fin as u8) << 7) | self.opcode as u8;
+        // dst[0] = ((self.fin as u8) << 7) | self.opcode as u8;
 
         // match header_len {
         //     6 => {
-        //         data[1] = Self::MASK_BIT | data_len as u8;
-        //         data[2..6].copy_from_slice(&mask);
+        //         dst[1] = MASK_BIT | data_len as u8;
+        //         dst[2..6].copy_from_slice(&mask);
         //     }
         //     8 => {
         //         let data_len_bytes = (data_len as u16).to_be_bytes();
-        //         data[1] = Self::MASK_BIT | 126;
-        //         data[2..4].copy_from_slice(&data_len_bytes);
-        //         data[4..8].copy_from_slice(&mask);
+        //         dst[1] = MASK_BIT | 126;
+        //         dst[2..4].copy_from_slice(&data_len_bytes);
+        //         dst[4..8].copy_from_slice(&mask);
         //     }
         //     14 => {
         //         let data_len_bytes = (data_len as u64).to_be_bytes();
-        //         data[1] = Self::MASK_BIT | 127;
-        //         data[2..10].copy_from_slice(&data_len_bytes);
-        //         data[10..14].copy_from_slice(&mask);
+        //         dst[1] = MASK_BIT | 127;
+        //         dst[2..10].copy_from_slice(&data_len_bytes);
+        //         dst[10..14].copy_from_slice(&mask);
         //     }
         //     _ => unreachable!(),
         // }
 
+        // for i in 0..data_len {
+        //     dst[i + header_len] = src[i] ^ mask[i & 3];
+        // }
+
         // UNSAFE IMPL
+        dst.reserve(len);
         unsafe {
-            let dst = data.as_mut_ptr();
+            dst.set_len(len);
+
+            let src = src.as_ptr();
+            let dst = dst.as_mut_ptr();
+
+            dst.write(((self.fin as u8) << 7) | self.opcode as u8);
             match header_len {
                 6 => {
-                    mask_data::<6>(dst, data_len, mask);
-                    dst.write(((self.fin as u8) << 7) | self.opcode as u8);
                     dst.add(1).write(MASK_BIT | data_len as u8);
-                    std::ptr::copy_nonoverlapping(mask.as_ptr(), dst.add(2), mask.len());
+                    ptr::copy_nonoverlapping(mask.as_ptr(), dst.add(2), mask.len());
                 }
                 8 => {
-                    mask_data::<8>(dst, data_len, mask);
-                    dst.write(((self.fin as u8) << 7) | self.opcode as u8);
-                    let data_len_bytes = (data_len as u16).to_be_bytes();
                     dst.add(1).write(MASK_BIT | 126);
-                    std::ptr::copy_nonoverlapping(
+                    let data_len_bytes = (data_len as u16).to_be_bytes();
+                    ptr::copy_nonoverlapping(
                         data_len_bytes.as_ptr(),
                         dst.add(2),
                         data_len_bytes.len(),
                     );
-                    std::ptr::copy_nonoverlapping(mask.as_ptr(), dst.add(4), mask.len());
+                    ptr::copy_nonoverlapping(mask.as_ptr(), dst.add(4), mask.len());
                 }
                 14 => {
-                    mask_data::<14>(dst, data_len, mask);
-                    dst.write(((self.fin as u8) << 7) | self.opcode as u8);
-                    let data_len_bytes = (data_len as u64).to_be_bytes();
                     dst.add(1).write(MASK_BIT | 127);
-                    std::ptr::copy_nonoverlapping(
+                    let data_len_bytes = (data_len as u64).to_be_bytes();
+                    ptr::copy_nonoverlapping(
                         data_len_bytes.as_ptr(),
                         dst.add(2),
                         data_len_bytes.len(),
                     );
-                    std::ptr::copy_nonoverlapping(mask.as_ptr(), dst.add(10), mask.len());
+                    ptr::copy_nonoverlapping(mask.as_ptr(), dst.add(10), mask.len());
                 }
                 _ => unreachable!(),
             }
+            mask_data(src, dst.add(header_len), data_len, mask);
         }
     }
 
@@ -143,31 +155,30 @@ impl Frame {
     }
 }
 
-unsafe fn mask_data<const HEADER_LEN: usize>(dst: *mut u8, len: usize, mask: [u8; 4]) {
+unsafe fn mask_data(src: *const u8, dst: *mut u8, len: usize, mask: [u8; 4]) {
     unsafe {
         #[cfg(target_arch = "x86_64")]
         {
             if len >= 16 && is_x86_feature_detected!("ssse3") {
-                return mask_simd_x86::<HEADER_LEN>(dst, len, mask);
+                return mask_simd_x86(src, dst, len, mask);
             }
         }
         #[cfg(target_arch = "aarch64")]
         {
             if len >= 16 && std::arch::is_aarch64_feature_detected!("neon") {
-                return mask_simd_aarch::<HEADER_LEN>(dst, len, mask);
+                return mask_simd_aarch(src, dst, len, mask);
             }
         }
-        mask_scalar::<HEADER_LEN>(dst, len, mask);
+        mask_scalar(src, dst, len, mask);
     }
 }
 
 #[inline]
-unsafe fn mask_scalar<const HEADER_LEN: usize>(dst: *mut u8, len: usize, mask: [u8; 4]) {
-    for i in (0..len).rev() {
-        let j = i + HEADER_LEN;
+unsafe fn mask_scalar(src: *const u8, dst: *mut u8, len: usize, mask: [u8; 4]) {
+    for i in 0..len {
         unsafe {
-            dst.add(j)
-                .write(dst.add(i).read() ^ mask.get_unchecked(i & 3));
+            dst.add(i)
+                .write(src.add(i).read() ^ mask.get_unchecked(i & 3));
         }
     }
 }
@@ -175,7 +186,7 @@ unsafe fn mask_scalar<const HEADER_LEN: usize>(dst: *mut u8, len: usize, mask: [
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "ssse3")]
 #[inline]
-unsafe fn mask_simd_x86<const HEADER_LEN: usize>(dst: *mut u8, len: usize, mask: [u8; 4]) {
+unsafe fn mask_simd_x86(src: *const u8, dst: *mut u8, len: usize, mask: [u8; 4]) {
     use std::{
         arch::x86_64::{__m128i, _mm_loadu_si128, _mm_set1_epi32, _mm_storeu_si128, _mm_xor_si128},
         mem,
@@ -183,22 +194,20 @@ unsafe fn mask_simd_x86<const HEADER_LEN: usize>(dst: *mut u8, len: usize, mask:
 
     let chunks = len / 16;
     unsafe {
-        // Handle remaining bytes first individually.
-        for i in (chunks * 16..len).rev() {
-            let j = i + HEADER_LEN;
-            dst.add(j)
-                .write(dst.add(i).read() ^ mask.get_unchecked(i & 3));
-        }
-
-        // Then handle full chunks with SIMD.
+        // Handle full chunks with SIMD.
         let mask_value = mem::transmute::<[u8; 4], i32>(mask);
         let mask_x4 = _mm_set1_epi32(mask_value);
-        for i in (0..chunks).rev() {
+        for i in 0..chunks {
             let i = i * 16;
-            let j = i + HEADER_LEN;
-            let src = _mm_loadu_si128(dst.add(i) as *const __m128i);
+            let src = _mm_loadu_si128(src.add(i) as *const __m128i);
             let masked = _mm_xor_si128(src, mask_x4);
-            _mm_storeu_si128(dst.add(j).cast::<__m128i>(), masked);
+            _mm_storeu_si128(dst.add(i).cast::<__m128i>(), masked);
+        }
+
+        // Handle remaining bytes first individually.
+        for i in chunks * 16..len {
+            dst.add(i)
+                .write(src.add(i).read() ^ mask.get_unchecked(i & 3));
         }
     }
 }
@@ -206,7 +215,7 @@ unsafe fn mask_simd_x86<const HEADER_LEN: usize>(dst: *mut u8, len: usize, mask:
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[inline]
-unsafe fn mask_simd_aarch<const HEADER_LEN: usize>(dst: *mut u8, len: usize, mask: [u8; 4]) {
+unsafe fn mask_simd_aarch(src: *const u8, dst: *mut u8, len: usize, mask: [u8; 4]) {
     use std::{
         arch::aarch64::{uint8x16_t, uint32x4_t, vdupq_n_u32, veorq_u8, vld1q_u8, vst1q_u8},
         mem,
@@ -214,22 +223,20 @@ unsafe fn mask_simd_aarch<const HEADER_LEN: usize>(dst: *mut u8, len: usize, mas
 
     let chunks = len / 16;
     unsafe {
-        // Handle remaining bytes first individually.
-        for i in (chunks * 16..len).rev() {
-            let j = i + HEADER_LEN;
-            dst.add(j)
-                .write(dst.add(i).read() ^ mask.get_unchecked(i & 3));
-        }
-
-        // Then handle full chunks with SIMD.
+        // Handle full chunks with SIMD.
         let mask_value = mem::transmute::<[u8; 4], u32>(mask);
         let mask_x4 = mem::transmute::<uint32x4_t, uint8x16_t>(vdupq_n_u32(mask_value));
-        for i in (0..chunks).rev() {
+        for i in 0..chunks {
             let i = i * 16;
-            let j = i + HEADER_LEN;
-            let src = vld1q_u8(dst.add(i).cast_const());
+            let src = vld1q_u8(src.add(i).cast_const());
             let masked = veorq_u8(src, mask_x4);
-            vst1q_u8(dst.add(j), masked);
+            vst1q_u8(dst.add(i), masked);
+        }
+
+        // Handle remaining bytes first individually.
+        for i in chunks * 16..len {
+            dst.add(i)
+                .write(src.add(i).read() ^ mask.get_unchecked(i & 3));
         }
     }
 }
@@ -305,17 +312,17 @@ mod tests {
         ];
         "125"
     )]
-    fn test_encode_control_slice(mut input: Vec<u8>) -> Vec<u8> {
+    fn test_encode_control(input: Vec<u8>) -> Vec<u8> {
         let frame = Frame {
             fin: true,
             opcode: Opcode::Binary,
         };
         let mask = [0x0a, 0xf1, 0x22, 0x33];
+        let mut output = Vec::with_capacity(input.len() + Frame::CONTROL_HEADER_LEN);
 
-        input.resize(input.len() + Frame::CONTROL_HEADER_LEN, 0);
-        frame.encode_control_slice(&mut input, mask);
+        frame.encode_control(&input, &mut output, mask);
 
-        input
+        output
     }
 
     // "hello"
@@ -388,16 +395,17 @@ mod tests {
         ];
         "126"
     )]
-    fn test_encode_vec(mut input: Vec<u8>) -> Vec<u8> {
+    fn test_encode_vec(input: Vec<u8>) -> Vec<u8> {
         let frame = Frame {
             fin: true,
             opcode: Opcode::Binary,
         };
         let mask = [0x0a, 0xf1, 0x22, 0x33];
+        let mut output = Vec::with_capacity(input.len() + Frame::MAX_HEADER_LEN);
 
-        frame.encode_vec(&mut input, mask);
+        frame.encode(&input, &mut output, mask);
 
-        input
+        output
     }
 
     #[test_case(&[], ""; "empty slice")]

@@ -1,4 +1,4 @@
-use std::{io, sync::Arc};
+use std::{io, result, sync::Arc};
 
 use base64::{Engine, prelude::BASE64_STANDARD};
 use http::Uri;
@@ -11,7 +11,7 @@ use rand::Rng;
 use rustls::{ClientConfig, ClientConnection, pki_types::InvalidDnsNameError};
 use sha1::{Digest, Sha1};
 
-use crate::Client;
+use crate::{Client, Config};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectError {
@@ -29,10 +29,10 @@ pub enum ConnectError {
     InvalidUriScheme,
 }
 
-pub type ConnectResult<T> = std::result::Result<T, ConnectError>;
+pub type ConnectResult<T> = result::Result<T, ConnectError>;
 
 impl Client<Stream<TcpStream, ClientConnection>> {
-    pub async fn connect_tls(uri: &Uri) -> ConnectResult<Self> {
+    pub async fn connect_tls(uri: &Uri, config: &Config) -> ConnectResult<Self> {
         if uri.scheme_str() != Some("wss") {
             return Err(ConnectError::InvalidUriScheme);
         }
@@ -40,11 +40,11 @@ impl Client<Stream<TcpStream, ClientConnection>> {
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-        let config = ClientConfig::builder()
+        let tls_config = ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();
 
-        let connector = TlsConnector::from(Arc::new(config));
+        let connector = TlsConnector::from(Arc::new(tls_config));
         let server_name =
             rustls::pki_types::ServerName::try_from(uri.host().unwrap_or_default().to_string())?;
 
@@ -57,12 +57,12 @@ impl Client<Stream<TcpStream, ClientConnection>> {
         .await?;
 
         let stream = connector.connect(server_name, stream).await?;
-        Ok(Self::new(handshake(stream, uri).await?))
+        Ok(Self::new(handshake(stream, uri).await?, config))
     }
 }
 
 impl Client<TcpStream> {
-    pub async fn connect_plain(uri: &Uri) -> ConnectResult<Self> {
+    pub async fn connect_plain(uri: &Uri, config: &Config) -> ConnectResult<Self> {
         if uri.scheme_str() != Some("ws") {
             return Err(ConnectError::InvalidUriScheme);
         }
@@ -75,7 +75,7 @@ impl Client<TcpStream> {
         ))
         .await?;
 
-        Ok(Self::new(handshake(stream, uri).await?))
+        Ok(Self::new(handshake(stream, uri).await?, config))
     }
 }
 

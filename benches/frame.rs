@@ -13,33 +13,33 @@ fn main() {
 }
 
 #[divan::bench(sample_count = 16384, sample_size = 100, args = [0, 1, 31, 32, 33, 125])]
-fn encode_control_slice(bencher: divan::Bencher, len: usize) {
+fn encode_control(bencher: divan::Bencher, len: usize) {
     let mut rng = SmallRng::from_os_rng();
-    let mut data = vec![0; len + Frame::CONTROL_HEADER_LEN];
-    for (i, item) in data.iter_mut().enumerate().take(len) {
-        *item = ((i + 1) % usize::from(u8::MAX)) as u8;
+    let mut src = Vec::with_capacity(len);
+    for i in 0..len {
+        src.push(((i + 1) % usize::from(u8::MAX)) as u8);
     }
-    bencher.bench_local(move || {
-        let mut data = data.clone();
+    let mut dst = Vec::with_capacity(src.len() + Frame::CONTROL_HEADER_LEN);
+    bencher.bench_local(|| {
         let mask = rng.random::<u32>().to_ne_bytes();
-        FRAME.encode_control_slice(&mut data, mask);
-        black_box(data);
+        FRAME.encode_control(&src, &mut dst, mask);
     });
+    black_box(dst);
 }
 
 #[divan::bench(sample_count = 4096, sample_size = 25, args = [1, 16, 125, 126, 65535, 65536])]
-fn encode_vec(bencher: divan::Bencher, len: usize) {
+fn encode(bencher: divan::Bencher, len: usize) {
     let mut rng = SmallRng::from_os_rng();
-    let mut data = Vec::with_capacity(len + 14);
+    let mut src = Vec::with_capacity(len + 14);
     for i in 0..len {
-        data.push(((i + 1) % usize::from(u8::MAX)) as u8);
+        src.push(((i + 1) % usize::from(u8::MAX)) as u8);
     }
-    bencher.bench_local(move || {
-        let mut data = data.clone();
+    let mut dst = Vec::with_capacity(src.len() + Frame::MAX_HEADER_LEN);
+    bencher.bench_local(|| {
         let mask = rng.random::<u32>().to_ne_bytes();
-        FRAME.encode_vec(&mut data, mask);
-        black_box(data);
+        FRAME.encode(&src, &mut dst, mask);
     });
+    black_box(dst);
 }
 
 #[divan::bench(sample_count = 4096, sample_size = 25, args = [1, 16, 128, 256, 1024, 65535, 65536])]

@@ -1,25 +1,12 @@
-use std::{io, mem, str, sync::LazyLock};
+use std::{io, mem, result, str, sync::LazyLock};
 
 use monoio::io::{
-    AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt, OwnedReadHalf, OwnedWriteHalf, Splitable,
+    AsyncReadRent, AsyncReadRentExt, AsyncWriteRent, AsyncWriteRentExt, OwnedReadHalf,
+    OwnedWriteHalf, Splitable,
 };
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
-use crate::{
-    CloseCode, Frame, Message, Opcode,
-    io::{AsyncReadRentExt as _, AsyncWriteRentExt as _},
-};
-
-macro_rules! protocol_violation {
-    ($self:expr, $reason:expr) => {
-        let reason: &'static str = $reason;
-        let (res, buffer) = $self.send_close(PROTOCOL_ERROR.clone()).await;
-        if let Err(e) = res {
-            return (Err(e.into()), buffer);
-        }
-        return (Err(Error::ProtocolViolation(reason)), buffer);
-    };
-}
+use crate::{CloseCode, Frame, Message, Opcode, io::AsyncReadRentExt as _};
 
 pub static PROTOCOL_ERROR: LazyLock<Vec<u8>> = LazyLock::new(|| {
     u16::from(CloseCode::ProtocolError)
@@ -27,6 +14,18 @@ pub static PROTOCOL_ERROR: LazyLock<Vec<u8>> = LazyLock::new(|| {
         .into_iter()
         .collect()
 });
+
+pub struct Config {
+    pub default_write_buffer_size: usize,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            default_write_buffer_size: 4096,
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -41,7 +40,7 @@ pub enum Error {
     },
 }
 
-pub type Result<T> = (std::result::Result<T, Error>, Vec<u8>);
+pub type BufResult<T> = (result::Result<T, Error>, Vec<u8>);
 
 pub struct Client<S>
 where
@@ -55,13 +54,18 @@ impl<S> Client<S>
 where
     S: AsyncWriteRent + Splitable<OwnedRead = OwnedReadHalf<S>, OwnedWrite = OwnedWriteHalf<S>>,
 {
-    pub fn new(stream: S) -> Self {
+    pub fn new(stream: S, config: &Config) -> Self {
         let (read_half, write_half) = stream.into_split();
         Self {
-            read_half: ReadHalf { inner: read_half },
+            read_half: ReadHalf {
+                inner: read_half,
+                buffer_2: vec![0; 2],
+                buffer_8: vec![0; 8],
+            },
             write_half: WriteHalf {
                 inner: write_half,
                 rng: SmallRng::from_os_rng(),
+                buffer: Vec::with_capacity(config.default_write_buffer_size),
             },
         }
     }
@@ -71,14 +75,14 @@ impl<S> Client<S>
 where
     S: AsyncReadRent + AsyncWriteRent,
 {
-    pub async fn next_msg(&mut self, mut buffer: Vec<u8>) -> Result<Message> {
+    pub async fn next_msg(&mut self, mut buffer: Vec<u8>) -> BufResult<Message> {
         buffer.clear();
         let mut message = None;
         let mut len = 0;
 
         loop {
             let is_empty = buffer.is_empty();
-            let (res, mut buf) = self.read_frame(buffer).await;
+            let (res, buf) = self.read_frame(buffer).await;
             let frame = match res {
                 Ok(frame) => frame,
                 Err(e) => {
@@ -88,16 +92,20 @@ where
 
             match frame.opcode {
                 Opcode::Ping => {
-                    // Write frame.
-                    buf.resize(buf.len() + Frame::CONTROL_HEADER_LEN, 0);
-                    let pong_frame = Frame {
-                        fin: true,
-                        opcode: Opcode::Pong,
-                    };
-                    let (res, buf) = self
+                    // Auto-send pong frame.
+                    if let Err(e) = self
                         .write_half
-                        .write_control_frame_offset(pong_frame, buf, len)
-                        .await;
+                        .write_control_frame(
+                            Frame {
+                                fin: true,
+                                opcode: Opcode::Pong,
+                            },
+                            &buf[len..],
+                        )
+                        .await
+                    {
+                        return (Err(e.into()), buf);
+                    }
                     match res {
                         Ok(_) => {
                             buffer = buf;
@@ -112,9 +120,14 @@ where
                     Some(Message::Text) => {
                         if frame.fin {
                             if Frame::validate_utf8(&buf).is_none() {
-                                protocol_violation!(
-                                    self,
-                                    "Received text frame with invalid utf-8."
+                                if let Err(e) = self.send_close(&PROTOCOL_ERROR).await {
+                                    return (Err(e.into()), buf);
+                                }
+                                return (
+                                    Err(Error::ProtocolViolation(
+                                        "Received text frame with invalid utf-8.",
+                                    )),
+                                    buf,
                                 );
                             }
                             return (Ok(Message::Text), buf);
@@ -130,22 +143,40 @@ where
                         len = buffer.len();
                     }
                     None => {
-                        protocol_violation!(
-                            self,
-                            "Received continuation frame without preceding text or binary frame."
+                        if let Err(e) = self.send_close(&PROTOCOL_ERROR).await {
+                            return (Err(e.into()), buf);
+                        }
+                        return (
+                            Err(Error::ProtocolViolation(
+                                "Received continuation frame without preceding text or binary frame.",
+                            )),
+                            buf,
                         );
                     }
                 },
                 Opcode::Text => {
                     if frame.fin {
                         if !is_empty {
-                            protocol_violation!(
-                                self,
-                                "Received a continuation frame without continuation opcode."
+                            if let Err(e) = self.send_close(&PROTOCOL_ERROR).await {
+                                return (Err(e.into()), buf);
+                            }
+                            return (
+                                Err(Error::ProtocolViolation(
+                                    "Received a continuation frame without continuation opcode.",
+                                )),
+                                buf,
                             );
                         }
                         if Frame::validate_utf8(&buf).is_none() {
-                            protocol_violation!(self, "Received text frame with invalid utf-8.");
+                            if let Err(e) = self.send_close(&PROTOCOL_ERROR).await {
+                                return (Err(e.into()), buf);
+                            }
+                            return (
+                                Err(Error::ProtocolViolation(
+                                    "Received text frame with invalid utf-8.",
+                                )),
+                                buf,
+                            );
                         }
                         return (Ok(Message::Text), buf);
                     }
@@ -156,9 +187,14 @@ where
                 Opcode::Binary => {
                     if frame.fin {
                         if !is_empty {
-                            protocol_violation!(
-                                self,
-                                "Received a continuation frame without continuation opcode."
+                            if let Err(e) = self.send_close(&PROTOCOL_ERROR).await {
+                                return (Err(e.into()), buf);
+                            }
+                            return (
+                                Err(Error::ProtocolViolation(
+                                    "Received a continuation frame without continuation opcode.",
+                                )),
+                                buf,
                             );
                         }
                         return (Ok(Message::Binary), buf);
@@ -173,10 +209,19 @@ where
                         let Ok(close_code) =
                             CloseCode::try_from(u16::from_be_bytes([buf[len], buf[len + 1]]))
                         else {
-                            protocol_violation!(self, "Invalid close code.");
+                            if let Err(e) = self.send_close(&PROTOCOL_ERROR).await {
+                                return (Err(e.into()), buf);
+                            }
+                            return (Err(Error::ProtocolViolation("Invalid close code.")), buf);
                         };
                         if close_code.is_reserved() {
-                            protocol_violation!(self, "Received reserved close code.");
+                            if let Err(e) = self.send_close(&PROTOCOL_ERROR).await {
+                                return (Err(e.into()), buf);
+                            }
+                            return (
+                                Err(Error::ProtocolViolation("Received reserved close code.")),
+                                buf,
+                            );
                         }
                         Some(close_code)
                     } else {
@@ -185,9 +230,14 @@ where
                     // Everything after close code is a utf-8 reason string.
                     let reason = if frame_len > 2 {
                         let Some(reason) = Frame::validate_utf8(&buf[len + 2..]) else {
-                            protocol_violation!(
-                                self,
-                                "Received close frame with invalid utf-8 reason."
+                            if let Err(e) = self.send_close(&PROTOCOL_ERROR).await {
+                                return (Err(e.into()), buf);
+                            }
+                            return (
+                                Err(Error::ProtocolViolation(
+                                    "Received close frame with invalid utf-8 reason.",
+                                )),
+                                buf,
                             );
                         };
                         Some(reason.to_owned())
@@ -195,16 +245,20 @@ where
                         None
                     };
 
-                    // Reply to close with the same code.
-                    buf.resize(buf.len() + Frame::CONTROL_HEADER_LEN, 0);
-                    let close_frame = Frame {
-                        fin: true,
-                        opcode: Opcode::Close,
-                    };
-                    let (res, buf) = self
+                    // Auto-send close with the same code as received.
+                    if let Err(e) = self
                         .write_half
-                        .write_control_frame_offset(close_frame, buf, len)
-                        .await;
+                        .write_control_frame(
+                            Frame {
+                                fin: true,
+                                opcode: Opcode::Close,
+                            },
+                            &buf[len..],
+                        )
+                        .await
+                    {
+                        return (Err(e.into()), buf);
+                    }
                     return match res {
                         Ok(_) => (Err(Error::Closed { code, reason }), buf),
                         Err(e) => (Err(e), buf),
@@ -219,20 +273,20 @@ where
         }
     }
 
-    pub async fn read_frame(&mut self, buffer: Vec<u8>) -> Result<Frame> {
+    pub async fn read_frame(&mut self, buffer: Vec<u8>) -> BufResult<Frame> {
         match self.read_half.read_frame(buffer).await {
             (Ok(res), buffer) => (Ok(res), buffer),
             (Err(Error::ProtocolViolation(reason)), buffer) => {
-                match self.send_close(PROTOCOL_ERROR.clone()).await {
-                    (Ok(()), _) => (Err(Error::ProtocolViolation(reason)), buffer),
-                    (Err(err), _) => (Err(err), buffer),
+                match self.send_close(&PROTOCOL_ERROR).await {
+                    Ok(()) => (Err(Error::ProtocolViolation(reason)), buffer),
+                    Err(err) => (Err(err.into()), buffer),
                 }
             }
             (Err(err), buffer) => (Err(err), buffer),
         }
     }
 
-    pub async fn send_ping(&mut self, buf: Vec<u8>) -> Result<()> {
+    pub async fn send_ping(&mut self, buf: &[u8]) -> io::Result<()> {
         self.send(
             Frame {
                 fin: true,
@@ -243,7 +297,7 @@ where
         .await
     }
 
-    pub async fn send_pong(&mut self, buf: Vec<u8>) -> Result<()> {
+    pub async fn send_pong(&mut self, buf: &[u8]) -> io::Result<()> {
         self.send(
             Frame {
                 fin: true,
@@ -254,7 +308,7 @@ where
         .await
     }
 
-    pub async fn send_binary(&mut self, buf: Vec<u8>) -> Result<()> {
+    pub async fn send_binary(&mut self, buf: &[u8]) -> io::Result<()> {
         self.send(
             Frame {
                 fin: true,
@@ -265,7 +319,7 @@ where
         .await
     }
 
-    pub async fn send_text(&mut self, buf: Vec<u8>) -> Result<()> {
+    pub async fn send_text(&mut self, buf: &[u8]) -> io::Result<()> {
         self.send(
             Frame {
                 fin: true,
@@ -276,7 +330,7 @@ where
         .await
     }
 
-    pub async fn send_close(&mut self, buf: Vec<u8>) -> Result<()> {
+    pub async fn send_close(&mut self, buf: &[u8]) -> io::Result<()> {
         self.send(
             Frame {
                 fin: true,
@@ -288,40 +342,37 @@ where
     }
 
     #[inline]
-    async fn send(&mut self, frame: Frame, buf: Vec<u8>) -> Result<()> {
-        let (res, mut buf) = self.write_frame(frame, buf).await;
-        buf.clear();
-        (res, buf)
+    async fn send(&mut self, frame: Frame, buf: &[u8]) -> io::Result<()> {
+        self.write_frame(frame, buf).await
     }
 
-    pub async fn write_frame(&mut self, frame: Frame, buffer: Vec<u8>) -> Result<()> {
+    pub async fn write_frame(&mut self, frame: Frame, buffer: &[u8]) -> io::Result<()> {
         self.write_half.write_frame(frame, buffer).await
     }
 }
 
 struct ReadHalf<S> {
     inner: OwnedReadHalf<S>,
+    buffer_2: Vec<u8>,
+    buffer_8: Vec<u8>,
 }
 
 impl<S> ReadHalf<S>
 where
     S: AsyncReadRent,
 {
-    pub async fn read_frame(&mut self, mut buffer: Vec<u8>) -> Result<Frame> {
-        const HEADER_LEN: usize = 2;
-        let data_len = buffer.len();
-
-        buffer.resize(data_len + HEADER_LEN, 0);
-        let (res, mut buffer) = self.inner.read_extend(buffer, HEADER_LEN).await;
+    pub async fn read_frame(&mut self, buffer: Vec<u8>) -> BufResult<Frame> {
+        let buffer_2 = mem::take(&mut self.buffer_2);
+        let (res, buffer_2) = self.inner.read_exact(buffer_2).await;
+        self.buffer_2 = buffer_2;
         match res {
             Ok(_) => {}
             Err(e) => {
                 return (Err(e.into()), buffer);
             }
         }
-        let b1 = buffer[buffer.len() - 2];
-        let b2 = buffer[buffer.len() - 1];
-        buffer.truncate(data_len);
+        let b1 = self.buffer_2[0];
+        let b2 = self.buffer_2[1];
 
         let fin = b1 & 0x80 != 0;
         let rsv = b1 & 0x70;
@@ -405,11 +456,12 @@ where
                 }
             }
             Opcode::Text | Opcode::Binary | Opcode::Continuation => {
-                (length, buffer) = match length {
+                length = match length {
                     126 => {
                         const LENGTH_LEN: usize = 2;
-                        buffer.resize(data_len + LENGTH_LEN, 0);
-                        let (res, mut buffer) = self.inner.read_extend(buffer, LENGTH_LEN).await;
+                        let buffer_2 = mem::take(&mut self.buffer_2);
+                        let (res, buffer_2) = self.inner.read_exact(buffer_2).await;
+                        self.buffer_2 = buffer_2;
                         match res {
                             Ok(_) => {}
                             Err(e) => {
@@ -417,14 +469,14 @@ where
                             }
                         }
                         let mut bytes = [0u8; LENGTH_LEN];
-                        bytes.copy_from_slice(&buffer[buffer.len() - LENGTH_LEN..]);
-                        buffer.truncate(data_len);
-                        (u16::from_be_bytes(bytes) as usize, buffer)
+                        bytes.copy_from_slice(&self.buffer_2);
+                        u16::from_be_bytes(bytes) as usize
                     }
                     127 => {
                         const LENGTH_LEN: usize = 8;
-                        buffer.resize(data_len + LENGTH_LEN, 0);
-                        let (res, mut buffer) = self.inner.read_extend(buffer, LENGTH_LEN).await;
+                        let buffer_8 = mem::take(&mut self.buffer_8);
+                        let (res, buffer_8) = self.inner.read_exact(buffer_8).await;
+                        self.buffer_8 = buffer_8;
                         match res {
                             Ok(_) => {}
                             Err(e) => {
@@ -432,11 +484,10 @@ where
                             }
                         }
                         let mut bytes = [0u8; LENGTH_LEN];
-                        bytes.copy_from_slice(&buffer[buffer.len() - LENGTH_LEN..]);
-                        buffer.truncate(data_len);
-                        (u64::from_be_bytes(bytes) as usize, buffer)
+                        bytes.copy_from_slice(&self.buffer_8);
+                        u64::from_be_bytes(bytes) as usize
                     }
-                    length => (length, buffer),
+                    length => length,
                 };
             }
         }
@@ -460,37 +511,26 @@ where
 {
     inner: OwnedWriteHalf<S>,
     rng: SmallRng,
+    buffer: Vec<u8>,
 }
 
 impl<S> WriteHalf<S>
 where
     S: AsyncWriteRent,
 {
-    pub async fn write_frame(&mut self, frame: Frame, mut buffer: Vec<u8>) -> Result<()> {
-        frame.encode_vec(&mut buffer, self.rng.random::<u32>().to_ne_bytes());
-        let (res, buffer) = self.inner.write_all(buffer).await;
-        match res {
-            Ok(_) => {}
-            Err(e) => return (Err(e.into()), buffer),
-        }
-        (Ok(()), buffer)
+    pub async fn write_frame(&mut self, frame: Frame, data: &[u8]) -> io::Result<()> {
+        let mut dst = mem::take(&mut self.buffer);
+        frame.encode(data, &mut dst, self.rng.random::<u32>().to_ne_bytes());
+        let (res, buffer) = self.inner.write_all(dst).await;
+        self.buffer = buffer;
+        res.map(|_| ())
     }
 
-    pub async fn write_control_frame_offset(
-        &mut self,
-        frame: Frame,
-        mut buffer: Vec<u8>,
-        offset: usize,
-    ) -> Result<()> {
-        frame.encode_control_slice(
-            &mut buffer[offset..],
-            self.rng.random::<u32>().to_ne_bytes(),
-        );
-        let (res, buffer) = self.inner.write_offset(buffer, offset).await;
-        match res {
-            Ok(_) => {}
-            Err(e) => return (Err(e.into()), buffer),
-        }
-        (Ok(()), buffer)
+    pub async fn write_control_frame(&mut self, frame: Frame, data: &[u8]) -> io::Result<()> {
+        let mut dst = mem::take(&mut self.buffer);
+        frame.encode_control(data, &mut dst, self.rng.random::<u32>().to_ne_bytes());
+        let (res, buffer) = self.inner.write_all(dst).await;
+        self.buffer = buffer;
+        res.map(|_| ())
     }
 }

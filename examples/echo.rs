@@ -1,17 +1,15 @@
 use core::str;
 
 use http::Uri;
+use monoio_ws::Config;
 
 #[monoio::main]
 async fn main() -> anyhow::Result<()> {
     let uri = Uri::from_static("wss://echo.websocket.org");
-    let mut ws = monoio_ws::Client::connect_tls(&uri).await?;
-
-    let mut buffer = Vec::with_capacity(4096);
+    let mut ws = monoio_ws::Client::connect_tls(&uri, &Config::default()).await?;
 
     println!("Receiving welcome text.");
-    buffer.clear();
-    let (res, mut buffer) = ws.read_frame(buffer).await;
+    let (res, mut buffer) = ws.read_frame(Vec::with_capacity(4096)).await;
     let frame = res?;
     println!(
         "Received welcome text: {frame:?} {}",
@@ -19,9 +17,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     println!("Sending ping.");
-    buffer.clear();
-    let (res, mut buffer) = ws.send_ping(buffer).await;
-    res?;
+    ws.send_ping(&[]).await?;
     println!("Sent ping.");
 
     println!("Receiving pong.");
@@ -31,10 +27,7 @@ async fn main() -> anyhow::Result<()> {
     println!("Received pong: {frame:?} {buffer:?}");
 
     println!("Sending text.");
-    buffer.clear();
-    buffer.extend_from_slice(b"hello");
-    let (res, mut buffer) = ws.send_text(buffer).await;
-    res?;
+    ws.send_text(b"hello").await?;
     println!("Sent text.");
 
     println!("Receiving text.");
