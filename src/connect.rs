@@ -55,6 +55,7 @@ impl Client<Stream<TcpStream, ClientConnection>> {
             uri.port_u16().unwrap_or(443)
         ))
         .await?;
+        TcpStream::set_nodelay(&stream, true)?;
 
         let stream = connector.connect(server_name, stream).await?;
         Ok(Self::new(handshake(stream, uri).await?, config))
@@ -74,6 +75,7 @@ impl Client<TcpStream> {
             uri.port_u16().unwrap_or(80)
         ))
         .await?;
+        TcpStream::set_nodelay(&stream, true)?;
 
         Ok(Self::new(handshake(stream, uri).await?, config))
     }
