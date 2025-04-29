@@ -72,13 +72,7 @@ async fn run_test_case(uri: &Uri, case: usize) -> anyhow::Result<()> {
     let uri = Uri::from_str(&format!("{uri}runCase?case={case}&agent={AGENT}"))?;
 
     println!("Connecting via {uri}.");
-    let mut client = Client::connect_plain(
-        &uri,
-        &Config {
-            default_write_buffer_size: 128 * 1024,
-        },
-    )
-    .await?;
+    let mut client = Client::connect_plain(&uri, &Config::default()).await?;
     println!("Connected.");
 
     let mut buffer = Vec::with_capacity(128 * 1024);

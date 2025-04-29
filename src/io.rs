@@ -1,5 +1,3 @@
-use std::io;
-
 use monoio::{
     BufResult,
     buf::{IoBufMut, SliceMut},
@@ -26,31 +24,17 @@ where
         let offset = buf.len();
         let end = offset + len;
 
-        buf.reserve(len);
+        buf.reserve(end);
 
-        let mut read = 0;
-        while read < len {
-            let buf_slice = unsafe { SliceMut::new_unchecked(buf, offset + read, end) };
-            let (result, buf_slice) = self.read(buf_slice).await;
-            buf = buf_slice.into_inner();
-            match result {
-                Ok(0) => {
-                    return (
-                        Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "failed to fill whole buffer",
-                        )),
-                        buf,
-                    );
-                }
-                Ok(n) => {
-                    read += n;
-                    unsafe { buf.set_init(offset + read) };
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) => return (Err(e), buf),
+        let buf_slice = unsafe { SliceMut::new_unchecked(buf, offset, end) };
+        let (result, buf_slice) = self.read(buf_slice).await;
+        buf = buf_slice.into_inner();
+        match result {
+            Ok(read) => {
+                unsafe { buf.set_init(offset + read) };
+                (Ok(read), buf)
             }
+            Err(e) => (Err(e), buf),
         }
-        (Ok(read), buf)
     }
 }

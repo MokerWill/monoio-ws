@@ -1,8 +1,7 @@
 use std::{io, mem, result, str, sync::LazyLock};
 
 use monoio::io::{
-    AsyncReadRent, AsyncReadRentExt, AsyncWriteRent, AsyncWriteRentExt, OwnedReadHalf,
-    OwnedWriteHalf, Splitable,
+    AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt, OwnedReadHalf, OwnedWriteHalf, Splitable,
 };
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
@@ -16,13 +15,15 @@ pub static PROTOCOL_ERROR: LazyLock<Vec<u8>> = LazyLock::new(|| {
 });
 
 pub struct Config {
-    pub default_write_buffer_size: usize,
+    pub read_buffer_capacity: usize,
+    pub write_buffer_capacity: usize,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            default_write_buffer_size: 4096,
+            read_buffer_capacity: 128 * 1024,
+            write_buffer_capacity: 128 * 1024,
         }
     }
 }
@@ -59,13 +60,13 @@ where
         Self {
             read_half: ReadHalf {
                 inner: read_half,
-                buffer_2: vec![0; 2],
-                buffer_8: vec![0; 8],
+                buffer: Vec::with_capacity(config.read_buffer_capacity),
+                consumed: 0,
             },
             write_half: WriteHalf {
                 inner: write_half,
                 rng: SmallRng::from_os_rng(),
-                buffer: Vec::with_capacity(config.default_write_buffer_size),
+                buffer: Vec::with_capacity(config.write_buffer_capacity),
             },
         }
     }
@@ -353,26 +354,36 @@ where
 
 struct ReadHalf<S> {
     inner: OwnedReadHalf<S>,
-    buffer_2: Vec<u8>,
-    buffer_8: Vec<u8>,
+    buffer: Vec<u8>,
+    consumed: usize,
 }
 
 impl<S> ReadHalf<S>
 where
     S: AsyncReadRent,
 {
-    pub async fn read_frame(&mut self, buffer: Vec<u8>) -> BufResult<Frame> {
-        let buffer_2 = mem::take(&mut self.buffer_2);
-        let (res, buffer_2) = self.inner.read_exact(buffer_2).await;
-        self.buffer_2 = buffer_2;
-        match res {
-            Ok(_) => {}
-            Err(e) => {
-                return (Err(e.into()), buffer);
+    const CHUNK_SIZE: usize = 4096;
+
+    pub async fn read_frame(&mut self, mut output: Vec<u8>) -> BufResult<Frame> {
+        const HEADER_LEN: usize = 2;
+
+        if self.consumed > 0 && self.buffer.len() > self.buffer.capacity() - Self::CHUNK_SIZE {
+            self.buffer.drain(..self.consumed);
+            self.consumed = 0;
+        }
+
+        while self.buffer.len() < self.consumed + HEADER_LEN {
+            let buffer = mem::take(&mut self.buffer);
+            let (res, buffer) = self.inner.read_extend(buffer, Self::CHUNK_SIZE).await;
+            self.buffer = buffer;
+            if let Err(e) = res {
+                return (Err(e.into()), output);
             }
         }
-        let b1 = self.buffer_2[0];
-        let b2 = self.buffer_2[1];
+
+        let b1 = self.buffer[self.consumed];
+        let b2 = self.buffer[self.consumed + 1];
+        self.consumed += HEADER_LEN;
 
         let fin = b1 & 0x80 != 0;
         let rsv = b1 & 0x70;
@@ -383,7 +394,7 @@ where
         if rsv != 0 {
             return (
                 Err(Error::ProtocolViolation("Reserve bit must be 0.")),
-                buffer,
+                output,
             );
         }
         if masked {
@@ -391,7 +402,7 @@ where
                 Err(Error::ProtocolViolation(
                     "Server to client communication should be unmasked.",
                 )),
-                buffer,
+                output,
             );
         }
 
@@ -408,7 +419,7 @@ where
             | Opcode::ReservedF => {
                 return (
                     Err(Error::ProtocolViolation("Use of reserved opcode.")),
-                    buffer,
+                    output,
                 );
             }
             Opcode::Close => {
@@ -417,7 +428,7 @@ where
                         Err(Error::ProtocolViolation(
                             "Close frame with a missing close reason byte.",
                         )),
-                        buffer,
+                        output,
                     );
                 }
                 if length > 125 {
@@ -425,7 +436,7 @@ where
                         Err(Error::ProtocolViolation(
                             "Control frame larger than 125 bytes.",
                         )),
-                        buffer,
+                        output,
                     );
                 }
                 if !fin {
@@ -433,7 +444,7 @@ where
                         Err(Error::ProtocolViolation(
                             "Control frame cannot be fragmented.",
                         )),
-                        buffer,
+                        output,
                     );
                 }
             }
@@ -443,7 +454,7 @@ where
                         Err(Error::ProtocolViolation(
                             "Control frame larger than 125 bytes.",
                         )),
-                        buffer,
+                        output,
                     );
                 }
                 if !fin {
@@ -451,7 +462,7 @@ where
                         Err(Error::ProtocolViolation(
                             "Control frame cannot be fragmented.",
                         )),
-                        buffer,
+                        output,
                     );
                 }
             }
@@ -459,32 +470,42 @@ where
                 length = match length {
                     126 => {
                         const LENGTH_LEN: usize = 2;
-                        let buffer_2 = mem::take(&mut self.buffer_2);
-                        let (res, buffer_2) = self.inner.read_exact(buffer_2).await;
-                        self.buffer_2 = buffer_2;
-                        match res {
-                            Ok(_) => {}
-                            Err(e) => {
-                                return (Err(e.into()), buffer);
+
+                        while self.buffer.len() < self.consumed + LENGTH_LEN {
+                            let buffer = mem::take(&mut self.buffer);
+                            let (res, buffer) =
+                                self.inner.read_extend(buffer, Self::CHUNK_SIZE).await;
+                            self.buffer = buffer;
+                            if let Err(e) = res {
+                                return (Err(e.into()), output);
                             }
                         }
+
                         let mut bytes = [0u8; LENGTH_LEN];
-                        bytes.copy_from_slice(&self.buffer_2);
+                        bytes.copy_from_slice(
+                            &self.buffer[self.consumed..self.consumed + LENGTH_LEN],
+                        );
+                        self.consumed += LENGTH_LEN;
                         u16::from_be_bytes(bytes) as usize
                     }
                     127 => {
                         const LENGTH_LEN: usize = 8;
-                        let buffer_8 = mem::take(&mut self.buffer_8);
-                        let (res, buffer_8) = self.inner.read_exact(buffer_8).await;
-                        self.buffer_8 = buffer_8;
-                        match res {
-                            Ok(_) => {}
-                            Err(e) => {
-                                return (Err(e.into()), buffer);
+
+                        while self.buffer.len() < self.consumed + LENGTH_LEN {
+                            let buffer = mem::take(&mut self.buffer);
+                            let (res, buffer) =
+                                self.inner.read_extend(buffer, Self::CHUNK_SIZE).await;
+                            self.buffer = buffer;
+                            if let Err(e) = res {
+                                return (Err(e.into()), output);
                             }
                         }
+
                         let mut bytes = [0u8; LENGTH_LEN];
-                        bytes.copy_from_slice(&self.buffer_8);
+                        bytes.copy_from_slice(
+                            &self.buffer[self.consumed..self.consumed + LENGTH_LEN],
+                        );
+                        self.consumed += LENGTH_LEN;
                         u64::from_be_bytes(bytes) as usize
                     }
                     length => length,
@@ -492,16 +513,20 @@ where
             }
         }
 
-        let (res, buffer) = self.inner.read_extend(buffer, length).await;
-        match res {
-            Ok(_) => {}
-            Err(e) => {
-                return (Err(e.into()), buffer);
+        while self.buffer.len() < self.consumed + length {
+            let buffer = mem::take(&mut self.buffer);
+            let (res, buffer) = self.inner.read_extend(buffer, Self::CHUNK_SIZE).await;
+            self.buffer = buffer;
+            if let Err(e) = res {
+                return (Err(e.into()), output);
             }
         }
 
+        output.extend_from_slice(&self.buffer[self.consumed..self.consumed + length]);
+        self.consumed += length;
+
         let frame = Frame { fin, opcode };
-        (Ok(frame), buffer)
+        (Ok(frame), output)
     }
 }
 
