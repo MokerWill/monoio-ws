@@ -76,14 +76,65 @@ impl<S> Client<S>
 where
     S: AsyncReadRent + AsyncWriteRent,
 {
-    pub async fn next_msg(&mut self, mut buffer: Vec<u8>) -> BufResult<Message> {
+    pub async fn next_msg(&mut self, buffer: Vec<u8>) -> BufResult<Message> {
+        self.read_half.next_msg(&mut self.write_half, buffer).await
+    }
+
+    pub async fn read_frame(&mut self, buffer: Vec<u8>) -> BufResult<Frame> {
+        self.read_half
+            .read_frame(&mut self.write_half, buffer)
+            .await
+    }
+
+    pub async fn send_ping(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.write_half.send_ping(buf).await
+    }
+
+    pub async fn send_pong(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.write_half.send_pong(buf).await
+    }
+
+    pub async fn send_binary(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.write_half.send_binary(buf).await
+    }
+
+    pub async fn send_text(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.write_half.send_text(buf).await
+    }
+
+    pub async fn send_close(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.write_half.send_text(buf).await
+    }
+
+    pub async fn write_frame(&mut self, frame: Frame, buffer: &[u8]) -> io::Result<()> {
+        self.write_half.write_frame(frame, buffer).await
+    }
+}
+
+struct ReadHalf<S> {
+    inner: OwnedReadHalf<S>,
+    buffer: Vec<u8>,
+    consumed: usize,
+}
+
+impl<S> ReadHalf<S>
+where
+    S: AsyncReadRent + AsyncWriteRent,
+{
+    const CHUNK_SIZE: usize = 4096;
+
+    pub async fn next_msg(
+        &mut self,
+        write: &mut WriteHalf<S>,
+        mut buffer: Vec<u8>,
+    ) -> BufResult<Message> {
         buffer.clear();
         let mut message = None;
         let mut len = 0;
 
         loop {
             let is_empty = buffer.is_empty();
-            let (res, buf) = self.read_frame(buffer).await;
+            let (res, buf) = self.read_frame(write, buffer).await;
             let frame = match res {
                 Ok(frame) => frame,
                 Err(e) => {
@@ -94,8 +145,7 @@ where
             match frame.opcode {
                 Opcode::Ping => {
                     // Auto-send pong frame.
-                    if let Err(e) = self
-                        .write_half
+                    if let Err(e) = write
                         .write_control_frame(
                             Frame {
                                 fin: true,
@@ -121,7 +171,7 @@ where
                     Some(Message::Text) => {
                         if frame.fin {
                             if Frame::validate_utf8(&buf).is_none() {
-                                if let Err(e) = self.send_close(&PROTOCOL_ERROR).await {
+                                if let Err(e) = write.send_close(&PROTOCOL_ERROR).await {
                                     return (Err(e.into()), buf);
                                 }
                                 return (
@@ -144,7 +194,7 @@ where
                         len = buffer.len();
                     }
                     None => {
-                        if let Err(e) = self.send_close(&PROTOCOL_ERROR).await {
+                        if let Err(e) = write.send_close(&PROTOCOL_ERROR).await {
                             return (Err(e.into()), buf);
                         }
                         return (
@@ -158,7 +208,7 @@ where
                 Opcode::Text => {
                     if frame.fin {
                         if !is_empty {
-                            if let Err(e) = self.send_close(&PROTOCOL_ERROR).await {
+                            if let Err(e) = write.send_close(&PROTOCOL_ERROR).await {
                                 return (Err(e.into()), buf);
                             }
                             return (
@@ -169,7 +219,7 @@ where
                             );
                         }
                         if Frame::validate_utf8(&buf).is_none() {
-                            if let Err(e) = self.send_close(&PROTOCOL_ERROR).await {
+                            if let Err(e) = write.send_close(&PROTOCOL_ERROR).await {
                                 return (Err(e.into()), buf);
                             }
                             return (
@@ -188,7 +238,7 @@ where
                 Opcode::Binary => {
                     if frame.fin {
                         if !is_empty {
-                            if let Err(e) = self.send_close(&PROTOCOL_ERROR).await {
+                            if let Err(e) = write.send_close(&PROTOCOL_ERROR).await {
                                 return (Err(e.into()), buf);
                             }
                             return (
@@ -210,13 +260,13 @@ where
                         let Ok(close_code) =
                             CloseCode::try_from(u16::from_be_bytes([buf[len], buf[len + 1]]))
                         else {
-                            if let Err(e) = self.send_close(&PROTOCOL_ERROR).await {
+                            if let Err(e) = write.send_close(&PROTOCOL_ERROR).await {
                                 return (Err(e.into()), buf);
                             }
                             return (Err(Error::ProtocolViolation("Invalid close code.")), buf);
                         };
                         if close_code.is_reserved() {
-                            if let Err(e) = self.send_close(&PROTOCOL_ERROR).await {
+                            if let Err(e) = write.send_close(&PROTOCOL_ERROR).await {
                                 return (Err(e.into()), buf);
                             }
                             return (
@@ -231,7 +281,7 @@ where
                     // Everything after close code is a utf-8 reason string.
                     let reason = if frame_len > 2 {
                         let Some(reason) = Frame::validate_utf8(&buf[len + 2..]) else {
-                            if let Err(e) = self.send_close(&PROTOCOL_ERROR).await {
+                            if let Err(e) = write.send_close(&PROTOCOL_ERROR).await {
                                 return (Err(e.into()), buf);
                             }
                             return (
@@ -247,8 +297,7 @@ where
                     };
 
                     // Auto-send close with the same code as received.
-                    if let Err(e) = self
-                        .write_half
+                    if let Err(e) = write
                         .write_control_frame(
                             Frame {
                                 fin: true,
@@ -274,11 +323,15 @@ where
         }
     }
 
-    pub async fn read_frame(&mut self, buffer: Vec<u8>) -> BufResult<Frame> {
-        match self.read_half.read_frame(buffer).await {
+    pub async fn read_frame(
+        &mut self,
+        write: &mut WriteHalf<S>,
+        buffer: Vec<u8>,
+    ) -> BufResult<Frame> {
+        match self.read_frame_inner(buffer).await {
             (Ok(res), buffer) => (Ok(res), buffer),
             (Err(Error::ProtocolViolation(reason)), buffer) => {
-                match self.send_close(&PROTOCOL_ERROR).await {
+                match write.send_close(&PROTOCOL_ERROR).await {
                     Ok(()) => (Err(Error::ProtocolViolation(reason)), buffer),
                     Err(err) => (Err(err.into()), buffer),
                 }
@@ -287,84 +340,7 @@ where
         }
     }
 
-    pub async fn send_ping(&mut self, buf: &[u8]) -> io::Result<()> {
-        self.send(
-            Frame {
-                fin: true,
-                opcode: Opcode::Ping,
-            },
-            buf,
-        )
-        .await
-    }
-
-    pub async fn send_pong(&mut self, buf: &[u8]) -> io::Result<()> {
-        self.send(
-            Frame {
-                fin: true,
-                opcode: Opcode::Pong,
-            },
-            buf,
-        )
-        .await
-    }
-
-    pub async fn send_binary(&mut self, buf: &[u8]) -> io::Result<()> {
-        self.send(
-            Frame {
-                fin: true,
-                opcode: Opcode::Binary,
-            },
-            buf,
-        )
-        .await
-    }
-
-    pub async fn send_text(&mut self, buf: &[u8]) -> io::Result<()> {
-        self.send(
-            Frame {
-                fin: true,
-                opcode: Opcode::Text,
-            },
-            buf,
-        )
-        .await
-    }
-
-    pub async fn send_close(&mut self, buf: &[u8]) -> io::Result<()> {
-        self.send(
-            Frame {
-                fin: true,
-                opcode: Opcode::Close,
-            },
-            buf,
-        )
-        .await
-    }
-
-    #[inline]
-    async fn send(&mut self, frame: Frame, buf: &[u8]) -> io::Result<()> {
-        self.write_frame(frame, buf).await
-    }
-
-    pub async fn write_frame(&mut self, frame: Frame, buffer: &[u8]) -> io::Result<()> {
-        self.write_half.write_frame(frame, buffer).await
-    }
-}
-
-struct ReadHalf<S> {
-    inner: OwnedReadHalf<S>,
-    buffer: Vec<u8>,
-    consumed: usize,
-}
-
-impl<S> ReadHalf<S>
-where
-    S: AsyncReadRent,
-{
-    const CHUNK_SIZE: usize = 4096;
-
-    pub async fn read_frame(&mut self, mut output: Vec<u8>) -> BufResult<Frame> {
+    async fn read_frame_inner(&mut self, mut output: Vec<u8>) -> BufResult<Frame> {
         const HEADER_LEN: usize = 2;
 
         if self.consumed > 0 && self.buffer.len() > self.buffer.capacity() - Self::CHUNK_SIZE {
@@ -543,6 +519,66 @@ impl<S> WriteHalf<S>
 where
     S: AsyncWriteRent,
 {
+    pub async fn send_ping(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.send(
+            Frame {
+                fin: true,
+                opcode: Opcode::Ping,
+            },
+            buf,
+        )
+        .await
+    }
+
+    pub async fn send_pong(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.send(
+            Frame {
+                fin: true,
+                opcode: Opcode::Pong,
+            },
+            buf,
+        )
+        .await
+    }
+
+    pub async fn send_binary(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.send(
+            Frame {
+                fin: true,
+                opcode: Opcode::Binary,
+            },
+            buf,
+        )
+        .await
+    }
+
+    pub async fn send_text(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.send(
+            Frame {
+                fin: true,
+                opcode: Opcode::Text,
+            },
+            buf,
+        )
+        .await
+    }
+
+    pub async fn send_close(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.send(
+            Frame {
+                fin: true,
+                opcode: Opcode::Close,
+            },
+            buf,
+        )
+        .await
+    }
+
+    #[inline]
+    async fn send(&mut self, frame: Frame, buf: &[u8]) -> io::Result<()> {
+        self.write_frame(frame, buf).await
+    }
+
     pub async fn write_frame(&mut self, frame: Frame, data: &[u8]) -> io::Result<()> {
         let mut dst = mem::take(&mut self.buffer);
         frame.encode(data, &mut dst, self.rng.random::<u32>().to_ne_bytes());
