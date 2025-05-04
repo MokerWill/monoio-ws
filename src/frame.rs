@@ -26,18 +26,38 @@ impl Message {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct Frame {
+pub struct Frame<'a> {
     pub fin: bool,
     pub opcode: Opcode,
+    pub data: &'a [u8],
 }
 
-impl Frame {
+impl<'a> Frame<'a> {
     pub const CONTROL_HEADER_LEN: usize = CONTROL_HEADER_LEN;
     pub const MAX_HEADER_LEN: usize = MAX_HEADER_LEN;
 
+    #[must_use]
+    pub fn binary(data: &'a [u8]) -> Self {
+        Self {
+            fin: true,
+            opcode: Opcode::Binary,
+            data,
+        }
+    }
+
+    #[must_use]
+    pub fn text(data: &'a str) -> Self {
+        Self {
+            fin: true,
+            opcode: Opcode::Text,
+            data: data.as_bytes(),
+        }
+    }
+
     #[inline]
     #[expect(clippy::uninit_vec)]
-    pub fn encode_control(self, src: &[u8], dst: &mut Vec<u8>, mask: [u8; 4]) {
+    pub fn encode_control(self, dst: &mut Vec<u8>, mask: [u8; 4]) {
+        let src = self.data;
         let data_len = src.len();
         let len = CONTROL_HEADER_LEN + data_len;
 
@@ -70,7 +90,8 @@ impl Frame {
 
     #[inline]
     #[expect(clippy::uninit_vec)]
-    pub fn encode(self, src: &[u8], dst: &mut Vec<u8>, mask: [u8; 4]) {
+    pub fn encode(self, dst: &mut Vec<u8>, mask: [u8; 4]) {
+        let src = self.data;
         let data_len = src.len();
         let header_len = match data_len {
             ..126 => 6,
@@ -316,11 +337,12 @@ mod tests {
         let frame = Frame {
             fin: true,
             opcode: Opcode::Binary,
+            data: &input,
         };
         let mask = [0x0a, 0xf1, 0x22, 0x33];
         let mut output = Vec::with_capacity(input.len() + Frame::CONTROL_HEADER_LEN);
 
-        frame.encode_control(&input, &mut output, mask);
+        frame.encode_control(&mut output, mask);
 
         output
     }
@@ -399,11 +421,12 @@ mod tests {
         let frame = Frame {
             fin: true,
             opcode: Opcode::Binary,
+            data: &input,
         };
         let mask = [0x0a, 0xf1, 0x22, 0x33];
         let mut output = Vec::with_capacity(input.len() + Frame::MAX_HEADER_LEN);
 
-        frame.encode(&input, &mut output, mask);
+        frame.encode(&mut output, mask);
 
         output
     }

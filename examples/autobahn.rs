@@ -53,11 +53,10 @@ async fn get_case_count(uri: &Uri) -> anyhow::Result<usize> {
     let mut client = Client::connect_plain(&uri, &Config::default()).await?;
     println!("Connected.");
 
-    let (res, buffer) = client.read_frame(Vec::new()).await;
-    let frame = res?;
+    let frame = client.read_frame().await?;
     println!("Received {frame:?}");
     assert!(matches!(frame.opcode, Opcode::Text));
-    let text = str::from_utf8(&buffer)?;
+    let text = str::from_utf8(frame.data)?;
     let case_count = text.parse::<usize>()?;
 
     client
@@ -125,8 +124,7 @@ async fn update_reports(uri: &Uri) -> anyhow::Result<()> {
     println!("Connected.");
 
     // Wait for the server to close the connection.
-    let (res, _) = client.read_frame(Vec::new()).await;
-    let frame = res?;
+    let frame = client.read_frame().await?;
     assert!(matches!(frame.opcode, Opcode::Close));
 
     println!("Updated reports.");

@@ -1,12 +1,7 @@
 use std::hint::black_box;
 
-use monoio_ws::{Frame, Opcode};
+use monoio_ws::Frame;
 use rand::{Rng, SeedableRng, rngs::SmallRng};
-
-const FRAME: Frame = Frame {
-    fin: true,
-    opcode: Opcode::Binary,
-};
 
 fn main() {
     divan::main();
@@ -22,7 +17,7 @@ fn encode_control(bencher: divan::Bencher, len: usize) {
     let mut dst = Vec::with_capacity(src.len() + Frame::CONTROL_HEADER_LEN);
     bencher.bench_local(|| {
         let mask = rng.random::<u32>().to_ne_bytes();
-        FRAME.encode_control(&src, &mut dst, mask);
+        Frame::binary(&src).encode_control(&mut dst, mask);
     });
     black_box(dst);
 }
@@ -37,7 +32,7 @@ fn encode(bencher: divan::Bencher, len: usize) {
     let mut dst = Vec::with_capacity(src.len() + Frame::MAX_HEADER_LEN);
     bencher.bench_local(|| {
         let mask = rng.random::<u32>().to_ne_bytes();
-        FRAME.encode(&src, &mut dst, mask);
+        Frame::binary(&src).encode(&mut dst, mask);
     });
     black_box(dst);
 }
