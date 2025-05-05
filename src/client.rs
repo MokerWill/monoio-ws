@@ -138,19 +138,6 @@ where
             };
 
             match frame.opcode {
-                Opcode::Ping => {
-                    // Auto-send pong frame.
-                    if let Err(e) = write
-                        .write_control_frame(Frame {
-                            fin: true,
-                            opcode: Opcode::Pong,
-                            data: frame.data,
-                        })
-                        .await
-                    {
-                        return (Err(e.into()), buffer);
-                    };
-                }
                 Opcode::Continuation => match message {
                     Some(Message::Text) if frame.fin => {
                         buffer.extend_from_slice(frame.data);
@@ -239,59 +226,29 @@ where
                 }
                 Opcode::Close => {
                     let code = if frame.data.len() >= 2 {
-                        let Ok(close_code) =
+                        // Ok to unwrap as code is already validated.
+                        let close_code =
                             CloseCode::try_from(u16::from_be_bytes([frame.data[0], frame.data[1]]))
-                        else {
-                            if let Err(e) = write.send_close(&PROTOCOL_ERROR).await {
-                                return (Err(e.into()), buffer);
-                            };
-                            return (Err(Error::ProtocolViolation("Invalid close code.")), buffer);
-                        };
-                        if close_code.is_reserved() {
-                            if let Err(e) = write.send_close(&PROTOCOL_ERROR).await {
-                                return (Err(e.into()), buffer);
-                            };
-                            return (
-                                Err(Error::ProtocolViolation("Received reserved close code.")),
-                                buffer,
-                            );
-                        }
+                                .unwrap();
                         Some(close_code)
                     } else {
                         None
                     };
                     // Everything after close code is a utf-8 reason string.
                     let reason = if frame.data.len() > 2 {
-                        let Some(reason) = Frame::validate_utf8(&frame.data[2..]) else {
-                            if let Err(e) = write.send_close(&PROTOCOL_ERROR).await {
-                                return (Err(e.into()), buffer);
-                            };
-                            return (
-                                Err(Error::ProtocolViolation(
-                                    "Received close frame with invalid utf-8 reason.",
-                                )),
-                                buffer,
-                            );
-                        };
-                        Some(reason.to_owned())
+                        Some(unsafe { str::from_utf8_unchecked(&frame.data[2..]) })
                     } else {
                         None
                     };
-
-                    // Auto-send close with the same code as received.
-                    if let Err(e) = write
-                        .write_control_frame(Frame {
-                            fin: true,
-                            opcode: Opcode::Close,
-                            data: frame.data,
-                        })
-                        .await
-                    {
-                        return (Err(e.into()), buffer);
-                    };
-                    return (Err(Error::Closed { code, reason }), buffer);
+                    return (
+                        Err(Error::Closed {
+                            code,
+                            reason: reason.map(ToOwned::to_owned),
+                        }),
+                        buffer,
+                    );
                 }
-                Opcode::Pong => {}
+                Opcode::Ping | Opcode::Pong => {}
                 _ => unreachable!(),
             }
         }
@@ -299,7 +256,56 @@ where
 
     pub async fn read_frame<'a>(&'a mut self, write: &mut WriteHalf<S>) -> Result<Frame<'a>> {
         match self.read_frame_inner().await {
-            Ok(res) => Ok(res),
+            Ok(frame) if matches!(frame.opcode, Opcode::Ping) => {
+                // Auto-send pong frame.
+                write
+                    .write_control_frame(Frame {
+                        fin: true,
+                        opcode: Opcode::Pong,
+                        data: frame.data,
+                    })
+                    .await?;
+                Ok(frame)
+            }
+            Ok(frame) if matches!(frame.opcode, Opcode::Close) => {
+                let _code = if frame.data.len() >= 2 {
+                    let Ok(close_code) =
+                        CloseCode::try_from(u16::from_be_bytes([frame.data[0], frame.data[1]]))
+                    else {
+                        write.send_close(&PROTOCOL_ERROR).await?;
+                        return Err(Error::ProtocolViolation("Invalid close code."));
+                    };
+                    if close_code.is_reserved() {
+                        write.send_close(&PROTOCOL_ERROR).await?;
+                        return Err(Error::ProtocolViolation("Received reserved close code."));
+                    }
+                    Some(close_code)
+                } else {
+                    None
+                };
+                // Everything after close code is a utf-8 reason string.
+                let _reason = if frame.data.len() > 2 {
+                    let Some(reason) = Frame::validate_utf8(&frame.data[2..]) else {
+                        write.send_close(&PROTOCOL_ERROR).await?;
+                        return Err(Error::ProtocolViolation(
+                            "Received close frame with invalid utf-8 reason.",
+                        ));
+                    };
+                    Some(reason)
+                } else {
+                    None
+                };
+                // Auto-send close with the same code as received.
+                write
+                    .write_control_frame(Frame {
+                        fin: true,
+                        opcode: Opcode::Close,
+                        data: frame.data,
+                    })
+                    .await?;
+                Ok(frame)
+            }
+            Ok(frame) => Ok(frame),
             Err(Error::ProtocolViolation(reason)) => {
                 write.send_close(&PROTOCOL_ERROR).await?;
                 Err(Error::ProtocolViolation(reason))
@@ -308,6 +314,7 @@ where
         }
     }
 
+    #[inline]
     async fn read_frame_inner(&mut self) -> Result<Frame> {
         const HEADER_LEN: usize = 2;
 
