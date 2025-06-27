@@ -208,15 +208,14 @@ unsafe fn mask_scalar(src: *const u8, dst: *mut u8, len: usize, mask: [u8; 4]) {
 #[target_feature(enable = "ssse3")]
 #[inline]
 unsafe fn mask_simd_x86(src: *const u8, dst: *mut u8, len: usize, mask: [u8; 4]) {
-    use std::{
-        arch::x86_64::{__m128i, _mm_loadu_si128, _mm_set1_epi32, _mm_storeu_si128, _mm_xor_si128},
-        mem,
+    use std::arch::x86_64::{
+        __m128i, _mm_loadu_si128, _mm_set1_epi32, _mm_storeu_si128, _mm_xor_si128,
     };
 
     let chunks = len / 16;
     unsafe {
         // Handle full chunks with SIMD.
-        let mask_value = mem::transmute::<[u8; 4], i32>(mask);
+        let mask_value = i32::from_ne_bytes(mask);
         let mask_x4 = _mm_set1_epi32(mask_value);
         for i in 0..chunks {
             let i = i * 16;
@@ -243,9 +242,9 @@ unsafe fn mask_simd_aarch(src: *const u8, dst: *mut u8, len: usize, mask: [u8; 4
     };
 
     let chunks = len / 16;
+    let mask_value = u32::from_ne_bytes(mask);
     unsafe {
         // Handle full chunks with SIMD.
-        let mask_value = mem::transmute::<[u8; 4], u32>(mask);
         let mask_x4 = mem::transmute::<uint32x4_t, uint8x16_t>(vdupq_n_u32(mask_value));
         for i in 0..chunks {
             let i = i * 16;
