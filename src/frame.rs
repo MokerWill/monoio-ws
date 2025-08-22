@@ -248,7 +248,7 @@ unsafe fn mask_simd_aarch(src: *const u8, dst: *mut u8, len: usize, mask: [u8; 4
         let mask_x4 = mem::transmute::<uint32x4_t, uint8x16_t>(vdupq_n_u32(mask_value));
         for i in 0..chunks {
             let i = i * 16;
-            let src = vld1q_u8(src.add(i).cast_const());
+            let src = vld1q_u8(src.add(i));
             let masked = veorq_u8(src, mask_x4);
             vst1q_u8(dst.add(i), masked);
         }

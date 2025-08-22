@@ -82,7 +82,7 @@ impl Client<TcpStream> {
 }
 
 /// Performs a WebSocket handshake on an existing TCP connection via HTTP 1.
-async fn handshake<T>(mut stream: T, uri: &Uri) -> ConnectResult<T>
+pub async fn handshake<T>(mut stream: T, uri: &Uri) -> ConnectResult<T>
 where
     T: AsyncReadRent + AsyncWriteRent,
 {

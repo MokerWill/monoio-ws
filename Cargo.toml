@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 base64 = "0.22"
+bumpalo = { version = "3.19", features = ["collections"] }
 http = "1"
 monoio = "0.2"
 # Use a custom fork which makes a stream type public.
@@ -24,4 +25,8 @@ test-case = "3"
 
 [[bench]]
 name = "frame"
+harness = false
+
+[[bench]]
+name = "zero_copy"
 harness = false
