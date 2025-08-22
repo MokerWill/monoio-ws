@@ -1,11 +1,12 @@
 use std::{io, mem, result, str, sync::LazyLock};
 
+use bytes::{BytesMut, Buf};
 use monoio::io::{
     AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt, OwnedReadHalf, OwnedWriteHalf, Splitable,
 };
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
-use crate::{CloseCode, Frame, Message, Opcode, io::AsyncReadRentExt as _};
+use crate::{CloseCode, Frame, Message, Opcode};
 
 pub static PROTOCOL_ERROR: LazyLock<Vec<u8>> = LazyLock::new(|| {
     u16::from(CloseCode::ProtocolError)
@@ -61,13 +62,12 @@ where
         Self {
             read_half: ReadHalf {
                 inner: read_half,
-                buffer: Vec::with_capacity(config.read_buffer_capacity),
-                consumed: 0,
+                buffer: BytesMut::with_capacity(config.read_buffer_capacity),
             },
             write_half: WriteHalf {
                 inner: write_half,
                 rng: SmallRng::from_os_rng(),
-                buffer: Vec::with_capacity(config.write_buffer_capacity),
+                buffer: BytesMut::with_capacity(config.write_buffer_capacity),
             },
         }
     }
@@ -81,7 +81,7 @@ where
         self.read_half.next_msg(&mut self.write_half, buffer).await
     }
 
-    pub async fn read_frame(&mut self) -> Result<Frame> {
+    pub async fn read_frame(&mut self) -> Result<Frame<'_>> {
         self.read_half.read_frame(&mut self.write_half).await
     }
 
@@ -112,8 +112,7 @@ where
 
 struct ReadHalf<S> {
     inner: OwnedReadHalf<S>,
-    buffer: Vec<u8>,
-    consumed: usize,
+    buffer: BytesMut,
 }
 
 impl<S> ReadHalf<S>
@@ -315,19 +314,19 @@ where
     }
 
     #[inline]
-    async fn read_frame_inner(&mut self) -> Result<Frame> {
+    async fn read_frame_inner(&mut self) -> Result<Frame<'static>> {
         const HEADER_LEN: usize = 2;
 
-        if self.consumed > 0 && self.buffer.len() > self.buffer.capacity() - Self::CHUNK_SIZE {
-            self.buffer.drain(..self.consumed);
-            self.consumed = 0;
+        // Compact buffer if we've consumed more than half of it
+        if self.buffer.len() > self.buffer.capacity() / 2 {
+            self.buffer.advance(self.buffer.len());
         }
 
         self.ensure_read(HEADER_LEN).await?;
 
-        let b1 = self.buffer[self.consumed];
-        let b2 = self.buffer[self.consumed + 1];
-        self.consumed += HEADER_LEN;
+        // Read header bytes directly from buffer
+        let b1 = self.buffer[0];
+        let b2 = self.buffer[1];
 
         let fin = b1 & 0x80 != 0;
         let rsv = b1 & 0x70;
@@ -391,25 +390,18 @@ where
                     126 => {
                         const LENGTH_LEN: usize = 2;
 
-                        self.ensure_read(LENGTH_LEN).await?;
-
-                        let mut bytes = [0u8; LENGTH_LEN];
-                        bytes.copy_from_slice(
-                            &self.buffer[self.consumed..self.consumed + LENGTH_LEN],
-                        );
-                        self.consumed += LENGTH_LEN;
+                        self.ensure_read(HEADER_LEN + LENGTH_LEN).await?;
+                        let bytes = [self.buffer[2], self.buffer[3]];
                         u16::from_be_bytes(bytes) as usize
                     }
                     127 => {
                         const LENGTH_LEN: usize = 8;
 
-                        self.ensure_read(LENGTH_LEN).await?;
-
-                        let mut bytes = [0u8; LENGTH_LEN];
-                        bytes.copy_from_slice(
-                            &self.buffer[self.consumed..self.consumed + LENGTH_LEN],
-                        );
-                        self.consumed += LENGTH_LEN;
+                        self.ensure_read(HEADER_LEN + LENGTH_LEN).await?;
+                        let bytes = [
+                            self.buffer[2], self.buffer[3], self.buffer[4], self.buffer[5],
+                            self.buffer[6], self.buffer[7], self.buffer[8], self.buffer[9],
+                        ];
                         u64::from_be_bytes(bytes) as usize
                     }
                     length => length,
@@ -417,21 +409,33 @@ where
             }
         }
 
-        self.ensure_read(length).await?;
+        self.ensure_read(HEADER_LEN + length).await?;
 
-        let data = &self.buffer[self.consumed..self.consumed + length];
-        self.consumed += length;
-
-        Ok(Frame { fin, opcode, data })
+        // Extract data using split_to and convert to static reference
+        self.buffer.advance(HEADER_LEN);
+        let data_bytes = self.buffer.split_to(length).freeze();
+        let data_static: &'static [u8] = Box::leak(data_bytes.to_vec().into_boxed_slice());
+        
+        Ok(Frame { fin, opcode, data: data_static })
     }
 
     #[inline]
     async fn ensure_read(&mut self, len: usize) -> Result<()> {
-        while self.buffer.len() < self.consumed + len {
-            let buffer = mem::take(&mut self.buffer);
-            let (res, buffer) = self.inner.read_extend(buffer, Self::CHUNK_SIZE).await;
-            self.buffer = buffer;
-            let _ = res?;
+        while self.buffer.len() < len {
+            let remaining = len - self.buffer.len();
+            let to_read = remaining.max(Self::CHUNK_SIZE);
+            
+            let (res, buffer) = self.inner.read(Vec::with_capacity(to_read)).await;
+            let n = res?;
+            
+            if n > 0 {
+                self.buffer.extend_from_slice(&buffer[..n]);
+            } else {
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Connection closed while reading",
+                )));
+            }
         }
         Ok(())
     }
@@ -443,7 +447,7 @@ where
 {
     inner: OwnedWriteHalf<S>,
     rng: SmallRng,
-    buffer: Vec<u8>,
+    buffer: BytesMut,
 }
 
 impl<S> WriteHalf<S>
@@ -501,18 +505,18 @@ where
     }
 
     pub async fn write_frame(&mut self, frame: Frame<'_>) -> io::Result<()> {
-        let mut dst = mem::take(&mut self.buffer);
+        let mut dst = mem::take(&mut self.buffer).freeze().to_vec();
         frame.encode(&mut dst, self.rng.random::<u32>().to_ne_bytes());
         let (res, buffer) = self.inner.write_all(dst).await;
-        self.buffer = buffer;
+        self.buffer = BytesMut::from_iter(buffer);
         res.map(|_| ())
     }
 
     pub async fn write_control_frame(&mut self, frame: Frame<'_>) -> io::Result<()> {
-        let mut dst = mem::take(&mut self.buffer);
+        let mut dst = mem::take(&mut self.buffer).freeze().to_vec();
         frame.encode_control(&mut dst, self.rng.random::<u32>().to_ne_bytes());
         let (res, buffer) = self.inner.write_all(dst).await;
-        self.buffer = buffer;
+        self.buffer = BytesMut::from_iter(buffer);
         res.map(|_| ())
     }
 }
