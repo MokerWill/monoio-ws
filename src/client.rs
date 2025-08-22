@@ -425,7 +425,7 @@ where
             let remaining = len - self.buffer.len();
             let to_read = remaining.max(Self::CHUNK_SIZE);
             
-            let (res, buffer) = self.inner.read(Vec::with_capacity(to_read)).await;
+            let (res, buffer) = self.inner.read(BytesMut::with_capacity(to_read)).await;
             let n = res?;
             
             if n > 0 {
